@@ -329,10 +329,20 @@ def _build_post_markup(user, link, share_text):
 
 def _send_media(ch_id, mtype, mid, caption, markup, protect=False, thumb_id=""):
     kw = {"caption": caption, "reply_markup": markup, "protect_content": protect}
-    if mtype == 'photo':    bot.send_photo(ch_id, mid, **kw)
-    elif mtype == 'video':  _send_video_with_thumb(ch_id, mid, thumb_id, **kw)
-    elif mtype == 'document': bot.send_document(ch_id, mid, **kw)
-    elif mtype == 'audio':  bot.send_audio(ch_id, mid, **kw)
+    if thumb_id:
+        try:
+            return bot.send_photo(ch_id, thumb_id, **kw)
+        except Exception as e:
+            logger.warning(f"send_photo with thumb_id failed, trying document/fallback: {e}")
+            try:
+                return bot.send_document(ch_id, thumb_id, **kw)
+            except Exception as e2:
+                logger.warning(f"send_document with thumb_id failed: {e2}")
+    if mtype == 'photo':      return bot.send_photo(ch_id, mid, **kw)
+    elif mtype == 'video':    return bot.send_video(ch_id, mid, **kw)
+    elif mtype == 'document': return bot.send_document(ch_id, mid, **kw)
+    elif mtype == 'audio':    return bot.send_audio(ch_id, mid, **kw)
+    else:                     return bot.send_message(ch_id, caption or "...", reply_markup=markup)
 
 def _prepare_thumb_bytes(raw_bytes):
     """টেলিগ্রামের নিয়ম অনুযায়ী থাম্বনেইল ঠিক করে দেয়: max 320x320px এবং max 200KB, JPEG ফরম্যাটে।
@@ -435,7 +445,7 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short
         pr_markup = _build_post_markup(user, d_link, clean_html(pr_caption))
         for ch_id in PREMIUM_CHANNEL_IDS:
             try:
-                _send_media(ch_id, mtype, mid, pr_caption, pr_markup, protect)
+                _send_media(ch_id, mtype, mid, pr_caption, pr_markup, protect, thumb_id)
                 posted += 1
             except Exception as e:
                 logger.warning(f"Premium channel post error [{ch_id}]: {e}")
@@ -444,7 +454,7 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short
     if LOG_CHANNEL_ID:
         try:
             log_cap = f"💾 <b>Backup</b> | 📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n👤 Uploader: <code>{admin_id}</code>"
-            _send_media(LOG_CHANNEL_ID, mtype, mid, log_cap, None, False)
+            _send_media(LOG_CHANNEL_ID, mtype, mid, log_cap, None, False, thumb_id)
         except Exception as e:
             logger.warning(f"Log channel post error: {e}")
 
@@ -1008,14 +1018,14 @@ def _handle_download_link_received(chat_id, link_text, user):
     caption = f"{ph_t}⬇️ ডাউনলোড করতে নিচের বাটনে ক্লিক করুন\n\n<i>🕐 {now_str}</i>{pf_t}".strip()
     markup = _build_post_markup(user, dl_link, clean_html(caption))
     protect = bool(get_setting("protect_content", 0))
-
+    thumb_id = f.get('thumb_id') or user.get('temp_thumb_id', '')
     posted = 0
     for ch_id in ad_ids:
         try:
-            _send_video_with_thumb(ch_id, f['file_id'], f.get('thumb_id', ''), caption=caption, reply_markup=markup, protect_content=protect)
+            _send_media(ch_id, f.get('type', 'video'), f['file_id'], caption, markup, protect, thumb_id=thumb_id)
             posted += 1
         except Exception as e:
-            logger.warning(f"Ad channel video post error [{ch_id}]: {e}")
+            logger.warning(f"Ad channel post error [{ch_id}]: {e}")
 
     _inc_stat("uploads")
     update_user(chat_id, {
@@ -1188,9 +1198,16 @@ def handle_message(message):
         _finalize_post(chat_id, None, text); return
 
     # ══ ভিডিও-স্পেশাল ফ্লো ধাপ ২: থাম্বনেইল ছবি এসেছে ══
-    if message.content_type == 'photo' and step == "wait_thumbnail" and is_admin(chat_id):
-        _handle_thumbnail_received(chat_id, message.photo[-1].file_id, user)
-        return
+    if step == "wait_thumbnail" and is_admin(chat_id):
+        if message.content_type == 'photo':
+            _handle_thumbnail_received(chat_id, message.photo[-1].file_id, user)
+            return
+        elif message.content_type == 'document':
+            _handle_thumbnail_received(chat_id, message.document.file_id, user)
+            return
+        elif text:
+            bot.send_message(chat_id, "⚠️ অনুগ্রহ করে একটি ছবি (Photo) থাম্বনেইল হিসেবে পাঠান।")
+            return
 
     # ══ ভিডিও-স্পেশাল ফ্লো ধাপ ৩: ডাউনলোড লিংক (শর্টেনার সাইট থেকে) এসেছে ══
     if step == "wait_video_dl_link" and text and is_admin(chat_id):
