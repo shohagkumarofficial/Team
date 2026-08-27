@@ -55,6 +55,7 @@ def _empty_db():
         "scheduled": {},         # sched_id -> scheduled post
         "admin_requests": {},    # chat_id -> request dict
         "force_sub": {},         # fs_id -> channel dict
+        "ad_channels": {},       # ad_id -> {id,name,channel_id,added_by} — Admin-দের যোগ করা Ads চ্যানেল
         "settings": {},          # key -> value
         "stats": {},             # date -> counters
     }
@@ -135,8 +136,9 @@ _DEFAULTS = {
     "link_filter": 0, "text_filter": 0,
     "link_repeat_count": 1,
     "terabox_key": "",           # প্রতিটা admin এর নিজস্ব শর্টেনার API key (আর্নিং এর জন্য)
-    "temp_media_id": "", "temp_media_type": "",
+    "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "",
     "pending_link": "", "pending_short_link": "",
+    "_adch_name": "",
     "joined_at": "", "last_active": "",
     "total_downloads": 0, "total_uploads": 0,
 }
@@ -178,6 +180,14 @@ def role_of(chat_id): return get_user(chat_id).get("role", "user")
 
 def all_admins():
     return [u for u in DB["users"].values() if u.get("role") == "admin"]
+
+# ══════════════════════════════════════════════════
+#  Ads চ্যানেল (env-ফিক্সড + Admin-দের বট থেকে যোগ করা)
+# ══════════════════════════════════════════════════
+def all_ad_channel_ids():
+    """env-এর ফিক্সড AD_CHANNEL_IDS + Admin-রা বট থেকে যোগ করা চ্যানেল — ডুপ্লিকেট বাদে।"""
+    extra = [c.get("channel_id") for c in DB.get("ad_channels", {}).values() if c.get("channel_id")]
+    return list(dict.fromkeys(AD_CHANNEL_IDS + extra))
 
 # ══════════════════════════════════════════════════
 #  স্ট্যাটিস্টিক্স
@@ -310,12 +320,24 @@ def _build_post_markup(user, link, share_text):
     mk.row(InlineKeyboardButton("🔗 শেয়ার করুন", url=f"https://t.me/share/url?url=&text={encoded}"))
     return mk
 
-def _send_media(ch_id, mtype, mid, caption, markup, protect=False):
+def _send_media(ch_id, mtype, mid, caption, markup, protect=False, thumb_id=""):
     kw = {"caption": caption, "reply_markup": markup, "protect_content": protect}
     if mtype == 'photo':    bot.send_photo(ch_id, mid, **kw)
-    elif mtype == 'video':  bot.send_video(ch_id, mid, **kw)
+    elif mtype == 'video':  _send_video_with_thumb(ch_id, mid, thumb_id, **kw)
     elif mtype == 'document': bot.send_document(ch_id, mid, **kw)
     elif mtype == 'audio':  bot.send_audio(ch_id, mid, **kw)
+
+def _send_video_with_thumb(ch_id, file_id, thumb_id, **kw):
+    """ভিডিও পাঠানোর সময় থাম্বনেইল যোগ করে — telebot ভার্সনভেদে param নাম আলাদা হতে পারে বলে fallback রাখা হলো।"""
+    if thumb_id:
+        try:
+            return bot.send_video(ch_id, file_id, thumbnail=thumb_id, **kw)
+        except TypeError:
+            try:
+                return bot.send_video(ch_id, file_id, thumb=thumb_id, **kw)
+            except Exception:
+                pass
+    return bot.send_video(ch_id, file_id, **kw)
 
 def _publish_to_channels(admin_id, user, mtype, mid, d_link, title):
     """ফিক্সড Ad/Premium/Log চ্যানেলে (ENV থেকে) পোস্ট করে।"""
@@ -332,7 +354,7 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title):
 
     terabox_key = user.get("terabox_key", "")
     short_link = get_short_link(d_link, terabox_key)
-    if not terabox_key and AD_CHANNEL_IDS:
+    if not terabox_key and all_ad_channel_ids():
         try:
             bot.send_message(admin_id, "⚠️ আপনার TeraBox/শর্টেনার API key সেট করা নেই — আপাতত সরাসরি লিংক ব্যবহার হচ্ছে, আর্নিং হবে না।\n🔧 সেট করতে: ⚙️ সেটিংস → 🔗 শর্টেনার Key")
         except Exception:
@@ -344,7 +366,7 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title):
     # Ad চ্যানেল — monetized short link
     ad_caption = f"{ph_t}{fc_txt}⬇️ ডাউনলোড করতে নিচের বাটনে ক্লিক করুন\n\n<i>🕐 {now_str}</i>{pf_t}".strip()
     ad_markup = _build_post_markup(user, short_link, clean_html(ad_caption))
-    for ch_id in AD_CHANNEL_IDS:
+    for ch_id in all_ad_channel_ids():
         try:
             _send_media(ch_id, mtype, mid, ad_caption, ad_markup, protect)
             posted += 1
@@ -397,7 +419,7 @@ def _deliver_files(chat_id, file_key, user):
         try:
             kw = {"caption": caption, "protect_content": protect}
             if f['type'] == 'document': res = bot.send_document(chat_id, f['file_id'], **kw)
-            elif f['type'] == 'video':  res = bot.send_video(chat_id, f['file_id'], **kw)
+            elif f['type'] == 'video':  res = _send_video_with_thumb(chat_id, f['file_id'], f.get('thumb_id', ''), **kw)
             elif f['type'] == 'photo':  res = bot.send_photo(chat_id, f['file_id'], **kw)
             elif f['type'] == 'audio':  res = bot.send_audio(chat_id, f['file_id'], **kw)
             else: res = None
@@ -450,6 +472,7 @@ def _admin_menu():
     m.row(_btn("📤 আপলোড শুরু করুন", "start_upload"), _btn("📦 ব্যাচ আপলোড", "start_batch"))
     m.row(_btn("⚙️ সেটিংস", "menu_settings"), _btn("📊 আমার স্ট্যাটস", "show_stats"))
     m.row(_btn("⏰ সিডিউল পোস্ট", "menu_schedule"), _btn("🔒 ফোর্স-সাব", "menu_forcesub"))
+    m.row(_btn("📢 Ads চ্যানেল", "menu_adchannels"))
     m.add(_btn("🔗 আমার রেফারেল লিংক", "my_referral"))
     return m
 
@@ -755,6 +778,28 @@ def cb(call):
             DB["force_sub"].pop(fs_id, None); save_db()
         call.data = "menu_forcesub"; cb(call)
 
+    # ══ Ads চ্যানেল (Admin/Owner — বট থেকে যোগ/রিমুভ) ══
+    elif data == "menu_adchannels":
+        m = _mk()
+        for a_id, ch in DB.get("ad_channels", {}).items():
+            m.row(_btn(f"📢 {ch.get('name','(নামহীন)')}", "noop"), _btn("🗑️", f"adch_del_{a_id}"))
+        m.add(_btn("➕ নতুন Ads চ্যানেল যোগ করুন", "adch_add"))
+        m.add(_back("main_menu"))
+        bot.edit_message_text(
+            f"📢 <b>Ads চ্যানেল</b>\n\n🔒 ফিক্সড (env, শুধু Owner বদলাতে পারবে): <b>{len(AD_CHANNEL_IDS)}</b>টি\n➕ Admin-যোগকৃত (বট থেকে): <b>{len(DB.get('ad_channels', {}))}</b>টি",
+            cid, mid, reply_markup=m
+        )
+
+    elif data == "adch_add":
+        update_step(cid, "wait_adch_name")
+        bot.edit_message_text("📢 নতুন Ads চ্যানেলের নাম লিখুন:", cid, mid)
+
+    elif data.startswith("adch_del_"):
+        a_id = data[9:]
+        with _db_lock:
+            DB.get("ad_channels", {}).pop(a_id, None); save_db()
+        call.data = "menu_adchannels"; cb(call)
+
     # ══ Owner: Admin Requests ══
     elif data == "menu_requests":
         if not is_owner(cid): bot.answer_callback_query(call.id, "⛔ শুধু Owner!", show_alert=True); return
@@ -837,6 +882,89 @@ def _render_bc_select(cid, mid):
         m.add(_btn(f"{chk} {a['chat_id']}", f"bc_toggle_{a['chat_id']}"))
     m.row(_btn("✅ কনফার্ম", "bc_select_confirm"), _back("menu_broadcast"))
     bot.edit_message_text(f"🎯 <b>Admin সিলেক্ট করুন</b>\nসিলেক্টেড: <b>{len(sel)}</b>", cid, mid, reply_markup=m)
+
+def _handle_thumbnail_received(chat_id, thumb_id, user):
+    """ভিডিও-স্পেশাল ফ্লো ধাপ ২: থাম্বনেইল সেভ, ফাইল রেকর্ড তৈরি, বট-লিংক এক-ক্লিক কপি সহ দেখানো, তারপর ডাউনলোড লিংক চাওয়া।"""
+    video_file_id = user.get("temp_media_id", "")
+    if not video_file_id:
+        bot.send_message(chat_id, "⚠️ ভিডিও পাওয়া যায়নি, আবার আপলোড শুরু করুন।")
+        update_user(chat_id, {"step": "none"})
+        return
+
+    file_key = str(uuid.uuid4().hex)[:10]
+    uid = str(uuid.uuid4().hex)[:12]
+    with _db_lock:
+        DB["files"][uid] = {
+            "uid": uid, "file_id": video_file_id, "type": "video", "uploader": chat_id,
+            "batch_id": "", "file_key": file_key, "thumb_id": thumb_id,
+            "uploaded_at": datetime.now().isoformat(),
+        }
+        save_db()
+
+    d_link = f"https://t.me/{BOT_USERNAME}?start={file_key}"
+    update_user(chat_id, {
+        "pending_link": file_key, "temp_thumb_id": thumb_id, "step": "wait_dl_link",
+    })
+
+    m = _mk()
+    try:
+        m.add(InlineKeyboardButton("📋 এক ক্লিকে কপি করুন", copy_text=telebot.types.CopyTextButton(text=d_link)))
+    except Exception:
+        pass  # পুরনো টেলিগ্রাম ক্লায়েন্ট/লাইব্রেরিতে সাপোর্ট না থাকলে বাটন ছাড়াই এগোবে
+    try:
+        bot.send_message(chat_id, f"✅ থাম্বনেইল সেট হয়েছে!\n\n🔗 <b>বট শেয়ার লিংক:</b>\n<code>{d_link}</code>\n(কোড টেক্সটে ট্যাপ করলেও কপি হয়ে যাবে)", reply_markup=m)
+    except Exception:
+        bot.send_message(chat_id, f"✅ থাম্বনেইল সেট হয়েছে!\n\n🔗 <b>বট শেয়ার লিংক:</b>\n<code>{d_link}</code>")
+
+    bot.send_message(
+        chat_id,
+        "📥 এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।\n"
+        "(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে লিংক পাবেন, সেটাই এখানে পাঠান — এটাই Ads চ্যানেলে পোস্ট হবে)"
+    )
+
+def _handle_download_link_received(chat_id, link_text, user):
+    """ভিডিও-স্পেশাল ফ্লো ধাপ ৩: শর্টেনার লিংক পাওয়া গেলে Ads চ্যানেলগুলোতে অটো-পোস্ট।"""
+    if not re.match(r'^https?://', link_text.strip(), re.IGNORECASE):
+        bot.send_message(chat_id, "⚠️ সঠিক লিংক দিন (http:// অথবা https:// দিয়ে শুরু হতে হবে)।")
+        return
+
+    file_key = user.get("pending_link", "")
+    files = [f for f in DB["files"].values() if f.get("file_key") == file_key]
+    if not files:
+        bot.send_message(chat_id, "❌ ফাইল পাওয়া যায়নি, আবার আপলোড করুন।")
+        update_user(chat_id, {"step": "none", "pending_link": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": ""})
+        return
+
+    ad_ids = all_ad_channel_ids()
+    if not ad_ids:
+        bot.send_message(chat_id, "⚠️ কোনো Ads চ্যানেল যোগ করা নেই। আগে 📢 Ads চ্যানেল মেনু থেকে একটি যোগ করুন, তারপর আবার লিংকটি পাঠান।")
+        return
+
+    f = files[0]
+    dl_link = link_text.strip()
+    ph = apply_filters(user.get("header", ""), chat_id)
+    pf = apply_filters(user.get("footer", ""), chat_id)
+    ph_t = f"{ph}\n\n" if ph else ""
+    pf_t = f"\n\n{pf}" if pf else ""
+    now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    caption = f"{ph_t}⬇️ ডাউনলোড করতে নিচের বাটনে ক্লিক করুন\n\n<i>🕐 {now_str}</i>{pf_t}".strip()
+    markup = _build_post_markup(user, dl_link, clean_html(caption))
+    protect = bool(get_setting("protect_content", 0))
+
+    posted = 0
+    for ch_id in ad_ids:
+        try:
+            _send_video_with_thumb(ch_id, f['file_id'], f.get('thumb_id', ''), caption=caption, reply_markup=markup, protect_content=protect)
+            posted += 1
+        except Exception as e:
+            logger.warning(f"Ad channel video post error [{ch_id}]: {e}")
+
+    _inc_stat("uploads")
+    update_user(chat_id, {
+        "total_uploads": user.get("total_uploads", 0) + 1,
+        "step": "none", "pending_link": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "",
+    })
+    bot.send_message(chat_id, f"✅ <b>পোস্ট সম্পন্ন!</b>\n📤 <b>{posted}</b>টি Ads চ্যানেলে পোস্ট হয়েছে।\n🔗 ডাউনলোড লিংক: {dl_link}")
 
 def _ask_title(chat_id, mid, batch_id, count):
     update_user(chat_id, {"pending_link": batch_id})
@@ -932,6 +1060,18 @@ def handle_message(message):
         update_user(chat_id, {"step": "none", "_fs_name": "", "_fs_channelid": ""})
         bot.send_message(chat_id, "✅ ফোর্স-সাব চ্যানেল যোগ হয়েছে।"); return
 
+    # ══ Ads চ্যানেল যোগ (Admin/Owner, বট থেকে) ══
+    if step == "wait_adch_name" and text:
+        update_user(chat_id, {"_adch_name": text, "step": "wait_adch_channelid"})
+        bot.send_message(chat_id, "📢 এবার চ্যানেলের Channel ID দিন (যেমন: -100xxxxxxxxxx)।\n⚠️ বটকে অবশ্যই ওই চ্যানেলে Admin হিসেবে যোগ করা থাকতে হবে, নাহলে পোস্ট যাবে না।"); return
+    if step == "wait_adch_channelid" and text:
+        a_id = str(uuid.uuid4().hex)[:8]
+        with _db_lock:
+            DB.setdefault("ad_channels", {})[a_id] = {"id": a_id, "name": user.get("_adch_name", ""), "channel_id": text, "added_by": chat_id}
+            save_db()
+        update_user(chat_id, {"step": "none", "_adch_name": ""})
+        bot.send_message(chat_id, "✅ নতুন Ads চ্যানেল যোগ হয়েছে। এখন থেকে এখানেও পোস্ট হবে।"); return
+
     # ══ সিডিউল সময় ══
     if step == "wait_schedule_time" and text:
         try:
@@ -955,6 +1095,16 @@ def handle_message(message):
     if step == "wait_post_title" and text:
         _finalize_post(chat_id, None, text); return
 
+    # ══ ভিডিও-স্পেশাল ফ্লো ধাপ ২: থাম্বনেইল ছবি এসেছে ══
+    if message.content_type == 'photo' and step == "wait_thumbnail" and is_admin(chat_id):
+        _handle_thumbnail_received(chat_id, message.photo[-1].file_id, user)
+        return
+
+    # ══ ভিডিও-স্পেশাল ফ্লো ধাপ ৩: ডাউনলোড লিংক (শর্টেনার সাইট থেকে) এসেছে ══
+    if step == "wait_dl_link" and text and is_admin(chat_id):
+        _handle_download_link_received(chat_id, text, user)
+        return
+
     # ══ ফাইল আপলোড (Admin/Owner only) ══
     if message.content_type in ('photo', 'document', 'video', 'audio'):
         if not is_admin(chat_id):
@@ -973,6 +1123,12 @@ def handle_message(message):
                 DB["files"][uid] = {"uid": uid, "file_id": file_id, "type": mtype, "uploader": chat_id, "batch_id": bid, "file_key": "", "uploaded_at": datetime.now().isoformat()}
                 save_db()
             bot.send_message(chat_id, f"✅ ব্যাচে যোগ হয়েছে। (মোট: {_get_file_count_from_link(bid)})")
+            return
+
+        # ভিডিও একক আপলোড হলে — আগে থাম্বনেইল ও ম্যানুয়াল ডাউনলোড লিংক চাওয়া হবে
+        if mtype == 'video' and step in ("wait_single", "none"):
+            update_user(chat_id, {"temp_media_id": file_id, "temp_media_type": mtype, "step": "wait_thumbnail"})
+            bot.send_message(chat_id, "🖼️ এখন এই ভিডিওর জন্য একটি ছবি থাম্বনেইল হিসেবে পাঠান:")
             return
 
         if step in ("wait_single", "none"):
@@ -1016,7 +1172,7 @@ def run_bot():
     if not BOT_TOKEN or BOT_TOKEN == "DUMMY_TOKEN":
         logger.error("❌ BOT_TOKEN সেট করা নেই! Polling শুরু করা যায়নি।")
         return
-    if not AD_CHANNEL_IDS and not PREMIUM_CHANNEL_IDS:
+    if not all_ad_channel_ids() and not PREMIUM_CHANNEL_IDS:
         logger.warning("⚠️ AD_CHANNEL_IDS / PREMIUM_CHANNEL_IDS সেট করা নেই — পোস্ট কোথাও যাবে না।")
     logger.info(f"🚀 Bot Polling started (v{BOT_VERSION})...")
     while True:
