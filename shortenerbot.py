@@ -7,11 +7,16 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 
-import os, re, time, json, uuid, threading, requests, telebot, logging
+import os, re, time, json, uuid, threading, requests, telebot, logging, io
 from datetime import datetime, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
+try:
+    from PIL import Image
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
 
 # ══════════════════════════════════════════════════
 #  লগিং
@@ -329,27 +334,56 @@ def _send_media(ch_id, mtype, mid, caption, markup, protect=False, thumb_id=""):
     elif mtype == 'document': bot.send_document(ch_id, mid, **kw)
     elif mtype == 'audio':  bot.send_audio(ch_id, mid, **kw)
 
+def _prepare_thumb_bytes(raw_bytes):
+    """টেলিগ্রামের নিয়ম অনুযায়ী থাম্বনেইল ঠিক করে দেয়: max 320x320px এবং max 200KB, JPEG ফরম্যাটে।
+    এই নিয়ম না মানলে টেলিগ্রাম কাস্টম থাম্বনেইল চুপচাপ বাতিল করে ভিডিও থেকে নিজে একটা বানিয়ে নেয় —
+    এটাই এতদিন ভিডিও-ফ্রেম থাম্বনেইল দেখানোর আসল কারণ ছিল।
+    """
+    if not raw_bytes:
+        return None
+    if not _PIL_OK:
+        logger.warning("Pillow ইনস্টল করা নেই — কাস্টম থাম্বনেইল রিসাইজ করা যাচ্ছে না। requirements.txt-এ Pillow যোগ করুন।")
+        return None
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img = img.convert("RGB")
+        img.thumbnail((320, 320))  # অনুপাত ঠিক রেখে max 320x320
+        quality = 90
+        while True:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            data = buf.getvalue()
+            if len(data) <= 200 * 1024 or quality <= 30:
+                return data
+            quality -= 10
+    except Exception as e:
+        logger.warning(f"Thumbnail resize failed: {e}")
+        return None
+
 def _send_video_with_thumb(ch_id, file_id, thumb_id, **kw):
     """ভিডিও পাঠানোর সময় থাম্বনেইল যোগ করে।
     ⚠️ টেলিগ্রাম থাম্বনেইলের জন্য পুরনো file_id রিইউজ করতে দেয় না — এটা অবশ্যই নতুন করে আপলোড (raw bytes) করতে হয়,
-    নাহলে টেলিগ্রাম সেটা চুপচাপ ইগনোর করে ভিডিও থেকে নিজেই একটা থাম্বনেইল বানিয়ে নেয়। তাই প্রতিবার পোস্ট করার সময়
-    থাম্বনেইল ছবিটা ডাউনলোড করে raw bytes হিসেবে পাঠানো হচ্ছে।
+    এবং সেটা অবশ্যই max 320x320px ও max 200KB হতে হবে — নাহলে টেলিগ্রাম সেটা চুপচাপ ইগনোর করে ভিডিও থেকে
+    নিজেই একটা থাম্বনেইল বানিয়ে নেয়। তাই প্রতিবার পোস্ট করার সময় থাম্বনেইল ছবিটা ডাউনলোড করে, রিসাইজ/কম্প্রেস
+    করে raw bytes হিসেবে পাঠানো হচ্ছে।
     """
     thumb_bytes = None
     if thumb_id:
         try:
             finfo = bot.get_file(thumb_id)
-            thumb_bytes = bot.download_file(finfo.file_path)
+            raw = bot.download_file(finfo.file_path)
+            thumb_bytes = _prepare_thumb_bytes(raw)
         except Exception as e:
             logger.warning(f"Thumbnail download failed: {e}")
             thumb_bytes = None
 
     if thumb_bytes:
+        thumb_file = ("thumb.jpg", thumb_bytes)
         try:
-            return bot.send_video(ch_id, file_id, thumbnail=thumb_bytes, **kw)
+            return bot.send_video(ch_id, file_id, thumbnail=thumb_file, **kw)
         except TypeError:
             try:
-                return bot.send_video(ch_id, file_id, thumb=thumb_bytes, **kw)
+                return bot.send_video(ch_id, file_id, thumb=thumb_file, **kw)
             except Exception as e:
                 logger.warning(f"send_video with custom thumb failed, sending without: {e}")
         except Exception as e:
