@@ -274,7 +274,9 @@ def _scheduled_post_worker():
                     admin_id = item['admin_id']
                     user = get_user(admin_id)
                     _publish_to_channels(admin_id, user, item['media_type'], item['media_id'],
-                                          item.get('d_link', ''), item.get('title', ''))
+                                          item.get('d_link', ''), item.get('title', ''),
+                                          manual_short_link=item.get('manual_short_link') or None,
+                                          thumb_id=item.get('thumb_id', ''))
                     try:
                         bot.send_message(admin_id, "⏰ <b>সিডিউল পোস্ট সম্পন্ন হয়েছে!</b>")
                     except Exception:
@@ -339,7 +341,7 @@ def _send_video_with_thumb(ch_id, file_id, thumb_id, **kw):
                 pass
     return bot.send_video(ch_id, file_id, **kw)
 
-def _publish_to_channels(admin_id, user, mtype, mid, d_link, title):
+def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short_link=None, thumb_id=""):
     """ফিক্সড Ad/Premium/Log চ্যানেলে (ENV থেকে) পোস্ট করে।"""
     ph = apply_filters(title or user.get("header", ""), admin_id)
     pf = apply_filters(user.get("footer", ""), admin_id)
@@ -352,13 +354,17 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title):
     file_count = _get_file_count_from_link(fkey)
     fc_txt = f"📁 <b>মোট ফাইল: {file_count}টি</b>\n" if file_count > 0 else ""
 
-    terabox_key = user.get("terabox_key", "")
-    short_link = get_short_link(d_link, terabox_key)
-    if not terabox_key and all_ad_channel_ids():
-        try:
-            bot.send_message(admin_id, "⚠️ আপনার TeraBox/শর্টেনার API key সেট করা নেই — আপাতত সরাসরি লিংক ব্যবহার হচ্ছে, আর্নিং হবে না।\n🔧 সেট করতে: ⚙️ সেটিংস → 🔗 শর্টেনার Key")
-        except Exception:
-            pass
+    if manual_short_link:
+        # অ্যাডমিন নিজে শর্টেনার সাইট থেকে বানিয়ে দেওয়া লিংক — এটাই ব্যবহার হবে
+        short_link = manual_short_link
+    else:
+        terabox_key = user.get("terabox_key", "")
+        short_link = get_short_link(d_link, terabox_key)
+        if not terabox_key and all_ad_channel_ids():
+            try:
+                bot.send_message(admin_id, "⚠️ আপনার TeraBox/শর্টেনার API key সেট করা নেই — আপাতত সরাসরি লিংক ব্যবহার হচ্ছে, আর্নিং হবে না।\n🔧 সেট করতে: ⚙️ সেটিংস → 🔗 শর্টেনার Key")
+            except Exception:
+                pass
 
     rpt = max(1, min(user.get("link_repeat_count", 1), 5))
     posted = 0
@@ -368,7 +374,7 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title):
     ad_markup = _build_post_markup(user, short_link, clean_html(ad_caption))
     for ch_id in all_ad_channel_ids():
         try:
-            _send_media(ch_id, mtype, mid, ad_caption, ad_markup, protect)
+            _send_media(ch_id, mtype, mid, ad_caption, ad_markup, protect, thumb_id)
             posted += 1
         except Exception as e:
             logger.warning(f"Ad channel post error [{ch_id}]: {e}")
@@ -869,9 +875,12 @@ def cb(call):
 
     elif data == "confirm_post_now":
         d_link = f"https://t.me/{BOT_USERNAME}?start={user.get('pending_link','')}"
-        posted = _publish_to_channels(cid, user, user.get("temp_media_type"), user.get("temp_media_id"), d_link, user.get("post_title", ""))
+        posted = _publish_to_channels(
+            cid, user, user.get("temp_media_type"), user.get("temp_media_id"), d_link, user.get("post_title", ""),
+            manual_short_link=user.get("pending_short_link") or None, thumb_id=user.get("temp_thumb_id", "")
+        )
         bot.edit_message_text(f"✅ <b>পোস্ট সম্পন্ন!</b>\n📤 <b>{posted}</b>টি চ্যানেলে পোস্ট হয়েছে।", cid, mid)
-        update_user(cid, {"pending_link": "", "post_title": "", "temp_media_id": "", "temp_media_type": ""})
+        update_user(cid, {"pending_link": "", "post_title": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "", "pending_short_link": ""})
 
 def _render_bc_select(cid, mid):
     user = get_user(cid)
@@ -903,7 +912,7 @@ def _handle_thumbnail_received(chat_id, thumb_id, user):
 
     d_link = f"https://t.me/{BOT_USERNAME}?start={file_key}"
     update_user(chat_id, {
-        "pending_link": file_key, "temp_thumb_id": thumb_id, "step": "wait_dl_link",
+        "pending_link": file_key, "temp_thumb_id": thumb_id, "step": "wait_video_dl_link",
     })
 
     m = _mk()
@@ -966,6 +975,35 @@ def _handle_download_link_received(chat_id, link_text, user):
     })
     bot.send_message(chat_id, f"✅ <b>পোস্ট সম্পন্ন!</b>\n📤 <b>{posted}</b>টি Ads চ্যানেলে পোস্ট হয়েছে।\n🔗 ডাউনলোড লিংক: {dl_link}")
 
+def _handle_generic_dl_link_received(chat_id, link_text, user):
+    """জেনেরিক ফ্লো (photo/document/audio/ব্যাচ): টাইটেলের পর ম্যানুয়াল শর্টেনার লিংক নিয়ে পোস্ট-নাউ/সিডিউল অপশন দেখানো।"""
+    if not re.match(r'^https?://', link_text.strip(), re.IGNORECASE):
+        bot.send_message(chat_id, "⚠️ সঠিক লিংক দিন (http:// অথবা https:// দিয়ে শুরু হতে হবে)।")
+        return
+
+    bid = user.get("pending_link", "")
+    files = [f for f in DB["files"].values() if f.get("batch_id") == bid or f.get("file_key") == bid]
+    if not files:
+        bot.send_message(chat_id, "❌ ফাইল পাওয়া যায়নি, আবার আপলোড করুন।")
+        update_user(chat_id, {"step": "none", "pending_link": "", "post_title": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": ""})
+        return
+
+    ad_ids = all_ad_channel_ids()
+    if not ad_ids:
+        bot.send_message(chat_id, "⚠️ কোনো Ads চ্যানেল যোগ করা নেই। আগে 📢 Ads চ্যানেল মেনু থেকে একটি যোগ করুন, তারপর আবার লিংকটি পাঠান।")
+        return
+
+    dl_link = link_text.strip()
+    d_link = f"https://t.me/{BOT_USERNAME}?start={bid}"
+    m = _mk()
+    m.row(_btn("🚀 এখনই পোস্ট করুন", "confirm_post_now"), _btn("⏰ সিডিউল করুন", "ask_schedule"))
+    update_user(chat_id, {"pending_short_link": dl_link, "step": "none"})
+    bot.send_message(
+        chat_id,
+        f"💎 ডাউনলোড লিংক সেভ হয়েছে:\n<code>{dl_link}</code>\n\n🔗 বট শেয়ার লিংক: <code>{d_link}</code>\n\nএখন পোস্ট করবেন নাকি সিডিউল করবেন?",
+        reply_markup=m
+    )
+
 def _ask_title(chat_id, mid, batch_id, count):
     update_user(chat_id, {"pending_link": batch_id})
     m = _mk()
@@ -985,16 +1023,20 @@ def _finalize_post(chat_id, mid, title):
         update_user(chat_id, {"step": "none"})
         return
 
-    mtype, mid_ = files[0]['type'], files[0]['file_id']
-    d_link = f"https://t.me/{BOT_USERNAME}?start={bid}"
+    if not all_ad_channel_ids():
+        bot.send_message(chat_id, "⚠️ কোনো Ads চ্যানেল যোগ করা নেই। আগে 📢 Ads চ্যানেল মেনু থেকে একটি যোগ করুন, তারপর আবার আপলোড করুন।")
+        update_user(chat_id, {"step": "none"})
+        return
 
-    m = _mk()
-    m.row(_btn("🚀 এখনই পোস্ট করুন", "confirm_post_now"), _btn("⏰ সিডিউল করুন", "ask_schedule"))
-    update_user(chat_id, {"post_title": title, "temp_media_id": mid_, "temp_media_type": mtype, "step": "none"})
+    mtype, mid_ = files[0]['type'], files[0]['file_id']
+    thumb_id = files[0].get('thumb_id', '')
+
+    update_user(chat_id, {"post_title": title, "temp_media_id": mid_, "temp_media_type": mtype, "temp_thumb_id": thumb_id, "step": "wait_post_dl_link"})
+    text_out = "✅ টাইটেল সেভ হয়েছে!\n\n📥 এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।\n(বটের শেয়ার লিংক শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই Ads চ্যানেলের ডাউনলোড বাটনে যাবে)"
     try:
-        bot.edit_message_text(f"💎 লিংক তৈরি:\n<code>{d_link}</code>\n\nএখন পোস্ট করবেন নাকি সিডিউল করবেন?", chat_id, mid, reply_markup=m)
+        bot.edit_message_text(text_out, chat_id, mid)
     except Exception:
-        bot.send_message(chat_id, f"💎 লিংক তৈরি:\n<code>{d_link}</code>\n\nএখন পোস্ট করবেন নাকি সিডিউল করবেন?", reply_markup=m)
+        bot.send_message(chat_id, text_out)
 
 # ══════════════════════════════════════════════════
 #  মেসেজ হ্যান্ডলার (টেক্সট + ফাইল)
@@ -1085,10 +1127,11 @@ def handle_message(message):
                 "sched_id": sched_id, "admin_id": chat_id,
                 "media_type": user.get("temp_media_type"), "media_id": user.get("temp_media_id"),
                 "d_link": f"https://t.me/{BOT_USERNAME}?start={bid}", "title": user.get("post_title", ""),
+                "manual_short_link": user.get("pending_short_link", ""), "thumb_id": user.get("temp_thumb_id", ""),
                 "scheduled_at": dt.isoformat(), "status": "pending", "created_at": datetime.now().isoformat(),
             }
             save_db()
-        update_user(chat_id, {"step": "none", "pending_link": "", "post_title": "", "temp_media_id": "", "temp_media_type": ""})
+        update_user(chat_id, {"step": "none", "pending_link": "", "post_title": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "", "pending_short_link": ""})
         bot.send_message(chat_id, f"⏰ <b>সিডিউল সেভ হয়েছে!</b>\n📅 সময়: <b>{text}</b>\n🆔 ID: <code>{sched_id}</code>"); return
 
     # ══ পোস্ট টাইটেল ══
@@ -1101,8 +1144,13 @@ def handle_message(message):
         return
 
     # ══ ভিডিও-স্পেশাল ফ্লো ধাপ ৩: ডাউনলোড লিংক (শর্টেনার সাইট থেকে) এসেছে ══
-    if step == "wait_dl_link" and text and is_admin(chat_id):
+    if step == "wait_video_dl_link" and text and is_admin(chat_id):
         _handle_download_link_received(chat_id, text, user)
+        return
+
+    # ══ জেনেরিক ফ্লো: টাইটেলের পর ডাউনলোড লিংক এসেছে (photo/document/audio/ব্যাচ) ══
+    if step == "wait_post_dl_link" and text and is_admin(chat_id):
+        _handle_generic_dl_link_received(chat_id, text, user)
         return
 
     # ══ ফাইল আপলোড (Admin/Owner only) ══
