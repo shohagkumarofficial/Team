@@ -1237,10 +1237,27 @@ def run_bot():
         return
     if not all_ad_channel_ids() and not PREMIUM_CHANNEL_IDS:
         logger.warning("⚠️ AD_CHANNEL_IDS / PREMIUM_CHANNEL_IDS সেট করা নেই — পোস্ট কোথাও যাবে না।")
+
+    # স্টার্টের আগে যেকোনো webhook/পুরনো getUpdates session ক্লিয়ার করে দেওয়া হলো —
+    # এটা "409 Conflict: terminated by other getUpdates request" এরর অনেকটা কমাতে সাহায্য করে,
+    # বিশেষ করে Render রিডিপ্লয়ের সময় সাময়িক ওভারল্যাপে।
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except Exception as e:
+        logger.warning(f"remove_webhook ব্যর্থ (ignore করা হলো): {e}")
+
     logger.info(f"🚀 Bot Polling started (v{BOT_VERSION})...")
     while True:
         try:
-            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60, skip_pending=True)
+        except telebot.apihelper.ApiTelegramException as e:
+            if getattr(e, "error_code", None) == 409:
+                logger.error("⚠️ 409 Conflict: একই BOT_TOKEN দিয়ে অন্য কোথাও (আরেকটা ইন্সট্যান্স/পুরনো ডিপ্লয়) polling চলছে। "
+                             "নিশ্চিত করুন Render-এ শুধু একটাই ইন্সট্যান্স/ডিপ্লয় চলছে এবং লোকালি বা অন্য কোথাও একই টোকেন চালু নেই।")
+            else:
+                logger.error(f"Polling error: {e}")
+            time.sleep(8)
         except Exception as e:
             logger.error(f"Polling error: {e}")
             time.sleep(5)
