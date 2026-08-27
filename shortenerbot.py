@@ -330,15 +330,30 @@ def _send_media(ch_id, mtype, mid, caption, markup, protect=False, thumb_id=""):
     elif mtype == 'audio':  bot.send_audio(ch_id, mid, **kw)
 
 def _send_video_with_thumb(ch_id, file_id, thumb_id, **kw):
-    """ভিডিও পাঠানোর সময় থাম্বনেইল যোগ করে — telebot ভার্সনভেদে param নাম আলাদা হতে পারে বলে fallback রাখা হলো।"""
+    """ভিডিও পাঠানোর সময় থাম্বনেইল যোগ করে।
+    ⚠️ টেলিগ্রাম থাম্বনেইলের জন্য পুরনো file_id রিইউজ করতে দেয় না — এটা অবশ্যই নতুন করে আপলোড (raw bytes) করতে হয়,
+    নাহলে টেলিগ্রাম সেটা চুপচাপ ইগনোর করে ভিডিও থেকে নিজেই একটা থাম্বনেইল বানিয়ে নেয়। তাই প্রতিবার পোস্ট করার সময়
+    থাম্বনেইল ছবিটা ডাউনলোড করে raw bytes হিসেবে পাঠানো হচ্ছে।
+    """
+    thumb_bytes = None
     if thumb_id:
         try:
-            return bot.send_video(ch_id, file_id, thumbnail=thumb_id, **kw)
+            finfo = bot.get_file(thumb_id)
+            thumb_bytes = bot.download_file(finfo.file_path)
+        except Exception as e:
+            logger.warning(f"Thumbnail download failed: {e}")
+            thumb_bytes = None
+
+    if thumb_bytes:
+        try:
+            return bot.send_video(ch_id, file_id, thumbnail=thumb_bytes, **kw)
         except TypeError:
             try:
-                return bot.send_video(ch_id, file_id, thumb=thumb_id, **kw)
-            except Exception:
-                pass
+                return bot.send_video(ch_id, file_id, thumb=thumb_bytes, **kw)
+            except Exception as e:
+                logger.warning(f"send_video with custom thumb failed, sending without: {e}")
+        except Exception as e:
+            logger.warning(f"send_video with custom thumb failed, sending without: {e}")
     return bot.send_video(ch_id, file_id, **kw)
 
 def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short_link=None, thumb_id=""):
