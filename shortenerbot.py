@@ -1314,25 +1314,56 @@ def run_bot():
             time.sleep(5)
 
 # ══════════════════════════════════════════════════
-#  Render Web Service এর জন্য হালকা Keep-Alive সার্ভার
-#  (Flask নেই — শুধু built-in http.server, health-check এর জন্য)
+#  UptimeRobot ও Web Service এর জন্য Keep-Alive সার্ভার + Self Ping
 # ══════════════════════════════════════════════════
 class _PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _send_ok(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(b"OK - Bot is running")))
         self.end_headers()
+
+    def do_GET(self):
+        self._send_ok()
         self.wfile.write(b"OK - Bot is running")
+
+    def do_HEAD(self):
+        self._send_ok()
+
     def log_message(self, *args):
-        pass  # সার্ভার লগ চেপে রাখা হলো
+        pass  # সার্ভার কনসোল লগ পরিষ্কার রাখতে চেপে রাখা হলো
 
 def _run_keepalive_server():
     port = int(os.environ.get("PORT", 8080))
     try:
-        HTTPServer(("0.0.0.0", port), _PingHandler).serve_forever()
+        server = HTTPServer(("0.0.0.0", port), _PingHandler)
+        logger.info(f"🌐 Keep-alive server running on port {port}")
+        server.serve_forever()
     except Exception as e:
         logger.warning(f"Keep-alive server error: {e}")
 
+def _self_ping_worker():
+    """১০ মিনিট পর পর নিজেকে নিজে HTTP রিকোয়েস্ট করে স্লিপ মোডে যাওয়া রোধ করে।"""
+    port = int(os.environ.get("PORT", 8080))
+    time.sleep(20)  # সার্ভার বুট হওয়ার জন্য অপেক্ষা
+    while True:
+        try:
+            # Render নিজে থেকেই RENDER_EXTERNAL_URL সেট করে, অথবা ইউজার APP_URL সেট করতে পারে
+            target_url = os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEB_URL", "")
+            if not target_url:
+                target_url = f"http://127.0.0.1:{port}"
+            if not target_url.startswith("http://") and not target_url.startswith("https://"):
+                target_url = f"https://{target_url}"
+
+            res = requests.get(target_url, timeout=15)
+            logger.info(f"🔄 Self-ping sent to {target_url} (Status: {res.status_code})")
+        except Exception as e:
+            logger.warning(f"Self-ping error: {e}")
+
+        # ১০ মিনিট (৬০০ সেকেন্ড) পর পর রিকোয়েস্ট যাবে
+        time.sleep(600)
+
 if __name__ == "__main__":
     threading.Thread(target=_run_keepalive_server, daemon=True).start()
+    threading.Thread(target=_self_ping_worker, daemon=True).start()
     run_bot()
