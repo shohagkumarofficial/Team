@@ -1333,23 +1333,29 @@ class _PingHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # সার্ভার কনসোল লগ পরিষ্কার রাখতে চেপে রাখা হলো
 
+def _get_port():
+    raw = (os.environ.get("PORT") or "").strip()
+    if raw and raw.isdigit():
+        return int(raw)
+    return 8080
+
 def _run_keepalive_server():
-    port = int(os.environ.get("PORT", 8080))
+    port = _get_port()
     try:
         server = HTTPServer(("0.0.0.0", port), _PingHandler)
         logger.info(f"🌐 Keep-alive server running on port {port}")
         server.serve_forever()
     except Exception as e:
-        logger.warning(f"Keep-alive server error: {e}")
+        logger.warning(f"Keep-alive server error on port {port}: {e}")
 
 def _self_ping_worker():
     """১০ মিনিট পর পর নিজেকে নিজে HTTP রিকোয়েস্ট করে স্লিপ মোডে যাওয়া রোধ করে।"""
-    port = int(os.environ.get("PORT", 8080))
+    port = _get_port()
     time.sleep(20)  # সার্ভার বুট হওয়ার জন্য অপেক্ষা
     while True:
         try:
             # Render নিজে থেকেই RENDER_EXTERNAL_URL সেট করে, অথবা ইউজার APP_URL সেট করতে পারে
-            target_url = os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEB_URL", "")
+            target_url = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEB_URL") or "").strip()
             if not target_url:
                 target_url = f"http://127.0.0.1:{port}"
             if not target_url.startswith("http://") and not target_url.startswith("https://"):
