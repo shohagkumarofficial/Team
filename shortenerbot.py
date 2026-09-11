@@ -61,6 +61,7 @@ def _empty_db():
         "admin_requests": {},    # chat_id -> request dict
         "force_sub": {},         # fs_id -> channel dict
         "ad_channels": {},       # ad_id -> {id,name,channel_id,added_by} — Admin-দের যোগ করা Ads চ্যানেল
+        "custom_buttons": {},    # btn_id -> {id,text,url,status,added_by} — পোস্টের সাথে যাওয়ার কাস্টম বাটন
         "settings": {},          # key -> value
         "stats": {},             # date -> counters
     }
@@ -144,6 +145,7 @@ _DEFAULTS = {
     "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "",
     "pending_link": "", "pending_short_link": "",
     "_adch_name": "",
+    "_btn_text": "",
     "joined_at": "", "last_active": "",
     "total_downloads": 0, "total_uploads": 0,
 }
@@ -325,6 +327,13 @@ def _build_post_markup(user, link, share_text):
     mk.row(InlineKeyboardButton("📥 ডাউনলোড", url=link))
     encoded = quote(share_text, safe='')
     mk.row(InlineKeyboardButton("🔗 শেয়ার করুন", url=f"https://t.me/share/url?url=&text={encoded}"))
+
+    # কাস্টম বাটন (যদি মাস্টার সুইচ ON থাকে এবং বাটনের স্ট্যাটাস ON থাকে)
+    if get_setting("custom_buttons_enabled", 1):
+        for btn in DB.get("custom_buttons", {}).values():
+            if btn.get("status") == "on" and btn.get("text") and btn.get("url"):
+                mk.row(InlineKeyboardButton(btn["text"], url=btn["url"]))
+
     return mk
 
 def _build_copy_button(link):
@@ -553,7 +562,7 @@ def _admin_menu():
     m.row(_btn("📤 আপলোড শুরু করুন", "start_upload"), _btn("📦 ব্যাচ আপলোড", "start_batch"))
     m.row(_btn("⚙️ সেটিংস", "menu_settings"), _btn("📊 আমার স্ট্যাটস", "show_stats"))
     m.row(_btn("⏰ সিডিউল পোস্ট", "menu_schedule"), _btn("🔒 ফোর্স-সাব", "menu_forcesub"))
-    m.row(_btn("📢 Ads চ্যানেল", "menu_adchannels"))
+    m.row(_btn("📢 Ads চ্যানেল", "menu_adchannels"), _btn("🔘 কাস্টম বাটন", "menu_buttons"))
     m.add(_btn("🔗 আমার রেফারেল লিংক", "my_referral"))
     return m
 
@@ -885,6 +894,66 @@ def cb(call):
             DB.get("ad_channels", {}).pop(a_id, None); save_db()
         call.data = "menu_adchannels"; cb(call)
 
+    # ══ কাস্টম বাটন (Admin/Owner — যোগ, ডিলিট, অন/অফ) ══
+    elif data == "menu_buttons":
+        m = _mk()
+        master_on = bool(get_setting("custom_buttons_enabled", 1))
+        m.add(_btn(f"মাস্টার সুইচ: {'🟢 চালু' if master_on else '🔴 বন্ধ'}", "btn_master_toggle"))
+
+        buttons = DB.get("custom_buttons", {})
+        for b_id, btn in buttons.items():
+            st_ico = _ico(btn.get("status") == "on")
+            m.row(
+                _btn(f"{st_ico} {btn.get('text', '(নামহীন)')}", f"btn_toggle_{b_id}"),
+                _btn("🗑️", f"btn_del_{b_id}")
+            )
+        m.add(_btn("➕ নতুন বাটন যোগ করুন", "btn_add"))
+        m.add(_back("main_menu"))
+        total = len(buttons)
+        active = sum(1 for b in buttons.values() if b.get("status") == "on")
+        bot.edit_message_text(
+            f"🔘 <b>কাস্টম পোস্ট বাটন ম্যানেজমেন্ট</b>\n\n"
+            f"প্রতিটি পোস্টের নিচে এই বাটনগুলো যুক্ত হবে (যেমন: ব্যাকআপ চ্যানেল, ওয়েবসাইট, টিউটোরিয়াল)।\n\n"
+            f"📊 মোট বাটন: <b>{total}</b>টি | সক্রিয়: <b>{active}</b>টি\n"
+            f"💡 অন/অফ করতে বাটনের নামের উপর ক্লিক করুন।",
+            cid, mid, reply_markup=m
+        )
+
+    elif data == "btn_master_toggle":
+        new_val = toggle_setting("custom_buttons_enabled")
+        bot.answer_callback_query(call.id, f"কাস্টম বাটন এখন {'🟢 চালু' if new_val else '🔴 বন্ধ'}", show_alert=True)
+        call.data = "menu_buttons"; cb(call)
+
+    elif data.startswith("btn_toggle_"):
+        b_id = data[11:]
+        btn = DB.get("custom_buttons", {}).get(b_id)
+        if btn:
+            btn["status"] = "off" if btn.get("status") == "on" else "on"
+            save_db()
+            st = "🟢 চালু" if btn["status"] == "on" else "🔴 বন্ধ"
+            bot.answer_callback_query(call.id, f"বাটন {st} করা হয়েছে!")
+        call.data = "menu_buttons"; cb(call)
+
+    elif data.startswith("btn_del_"):
+        b_id = data[8:]
+        with _db_lock:
+            DB.get("custom_buttons", {}).pop(b_id, None); save_db()
+        bot.answer_callback_query(call.id, "🗑️ বাটন মুছে ফেলা হয়েছে!", show_alert=True)
+        call.data = "menu_buttons"; cb(call)
+
+    elif data == "btn_add":
+        update_step(cid, "wait_btn_text")
+        m = _mk(); m.add(_back("menu_buttons"))
+        bot.edit_message_text(
+            "🔘 <b>নতুন বাটনের নাম / টেক্সট লিখুন:</b>\n\n"
+            "উদাহরণ:\n"
+            "• <code>📢 Join Backup Channel</code>\n"
+            "• <code>🌐 আমাদের ওয়েবসাইট</code>\n"
+            "• <code>🎬 Movie Request Group</code>\n\n"
+            "বাতিল করতে /cancel লিখুন বা নিচের ব্যাক বাটন চাপুন।",
+            cid, mid, reply_markup=m
+        )
+
     # ══ Owner: Admin Requests ══
     elif data == "menu_requests":
         if not is_owner(cid): bot.answer_callback_query(call.id, "⛔ শুধু Owner!", show_alert=True); return
@@ -1212,6 +1281,53 @@ def handle_message(message):
             save_db()
         update_user(chat_id, {"step": "none", "_adch_name": ""})
         bot.send_message(chat_id, "✅ নতুন Ads চ্যানেল যোগ হয়েছে। এখন থেকে এখানেও পোস্ট হবে।"); return
+
+    # ══ কাস্টম বাটন যোগ (Admin/Owner) ══
+    if step == "wait_btn_text" and text and is_admin(chat_id):
+        update_user(chat_id, {"_btn_text": text, "step": "wait_btn_url"})
+        m = _mk(); m.add(_back("menu_buttons"))
+        bot.send_message(
+            chat_id,
+            f"🔗 এবার <b>'{clean_html(text)}'</b> বাটনের লিংক (URL) পাঠান:\n"
+            f"(যেমন: <code>https://t.me/yourchannel</code> বা <code>https://yoursite.com</code>)",
+            reply_markup=m
+        )
+        return
+
+    if step == "wait_btn_url" and text and is_admin(chat_id):
+        btn_url = text.strip()
+        if not re.match(r'^(https?://|t\.me/)', btn_url, re.IGNORECASE):
+            bot.send_message(chat_id, "⚠️ সঠিক URL দিন (যেমন: https://t.me/... বা https://...)")
+            return
+        if btn_url.startswith("t.me/"):
+            btn_url = f"https://{btn_url}"
+
+        b_id = str(uuid.uuid4().hex)[:8]
+        btn_text = user.get("_btn_text", "Button")
+        with _db_lock:
+            DB.setdefault("custom_buttons", {})[b_id] = {
+                "id": b_id,
+                "text": btn_text,
+                "url": btn_url,
+                "status": "on",
+                "added_by": chat_id,
+                "created_at": datetime.now().isoformat()
+            }
+            save_db()
+
+        update_user(chat_id, {"step": "none", "_btn_text": ""})
+        m = _mk()
+        m.add(_btn("🔘 বাটন লিস্ট দেখুন", "menu_buttons"), _back("main_menu"))
+        bot.send_message(
+            chat_id,
+            f"✅ <b>নতুন কাস্টম বাটন যোগ হয়েছে!</b>\n\n"
+            f"🔘 নাম: <b>{clean_html(btn_text)}</b>\n"
+            f"🔗 লিংক: <code>{btn_url}</code>\n"
+            f"🟢 স্ট্যাটাস: <b>চালু (ON)</b>\n\n"
+            f"এখন থেকে প্রতিটি পোস্টের সাথে এই বাটনটি যাবে।",
+            reply_markup=m
+        )
+        return
 
     # ══ সিডিউল সময় ══
     if step == "wait_schedule_time" and text:
