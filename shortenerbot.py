@@ -48,9 +48,19 @@ BOT_VERSION = "7.0.0"
 bot = telebot.TeleBot(BOT_TOKEN or "DUMMY_TOKEN", parse_mode="HTML")
 
 # ══════════════════════════════════════════════════
-#  JSON ডাটাবেস (MongoDB এর বদলে)
+#  Cloudflare D1 ও JSON ডাটাবেস
 # ══════════════════════════════════════════════════
+CF_ACCOUNT_ID     = os.environ.get("CF_ACCOUNT_ID", "").strip()
+CF_D1_DATABASE_ID = os.environ.get("CF_D1_DATABASE_ID", "").strip()
+CF_API_TOKEN      = os.environ.get("CF_API_TOKEN", "").strip()
+
+def is_cf_enabled():
+    return bool(CF_ACCOUNT_ID and CF_D1_DATABASE_ID and CF_API_TOKEN)
+
 _db_lock = threading.RLock()
+_cf_dirty_sections = set()
+_cf_sync_lock = threading.Lock()
+_cf_sync_event = threading.Event()
 
 def _empty_db():
     return {
@@ -66,27 +76,153 @@ def _empty_db():
         "stats": {},             # date -> counters
     }
 
+def _cf_d1_query(sql, params=None):
+    """Cloudflare D1 REST API-তে কোয়েরি পাঠায়।"""
+    if not is_cf_enabled():
+        return None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_DATABASE_ID}/query"
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    body = {"sql": sql, "params": params or []}
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=12)
+        data = r.json()
+        if data.get("success"):
+            res = data.get("result", [])
+            if res and isinstance(res, list):
+                return res[0].get("results", [])
+            return []
+        else:
+            logger.error(f"Cloudflare D1 query failed: {data.get('errors')}")
+            return None
+    except Exception as e:
+        logger.error(f"Cloudflare D1 request error: {e}")
+        return None
+
+def _init_cf_d1():
+    """Cloudflare D1 টেবিল তৈরি/ইনিশিয়ালাইজ করে।"""
+    if not is_cf_enabled():
+        return False
+    sql = """
+    CREATE TABLE IF NOT EXISTS bot_sections (
+        section TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """
+    res = _cf_d1_query(sql)
+    if res is not None:
+        logger.info("✅ Cloudflare D1 database connected and initialized!")
+        return True
+    else:
+        logger.warning("⚠️ Cloudflare D1 connection failed. Falling back to local JSON.")
+        return False
+
+def _cf_save_section_direct(section, val):
+    """সরাসরি Cloudflare D1-এ একটি সেকশন সেভ করে।"""
+    sql = """
+    INSERT INTO bot_sections (section, data, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(section) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at;
+    """
+    raw_json = json.dumps(val, ensure_ascii=False)
+    now_str = datetime.now().isoformat()
+    return _cf_d1_query(sql, [section, raw_json, now_str])
+
 def _load_db():
-    if os.path.exists(DATA_FILE):
+    data = _empty_db()
+    loaded_from_cf = False
+
+    if is_cf_enabled():
+        try:
+            if _init_cf_d1():
+                rows = _cf_d1_query("SELECT section, data FROM bot_sections;")
+                if rows:
+                    for row in rows:
+                        sec = row.get("section")
+                        raw = row.get("data")
+                        if sec and raw:
+                            try:
+                                data[sec] = json.loads(raw)
+                            except Exception as e:
+                                logger.error(f"Failed to parse section {sec} from CF: {e}")
+                    logger.info(f"✅ Loaded {len(rows)} sections from Cloudflare D1!")
+                    loaded_from_cf = True
+                else:
+                    logger.info("Cloudflare D1 is currently empty.")
+        except Exception as e:
+            logger.error(f"Error loading from Cloudflare D1: {e}")
+
+    # যদি ক্লাউডফ্লেয়ার সক্রিয় না থাকে বা খালি থাকে, তখন লোকাল ফাইল থেকে লোড হবে
+    if not loaded_from_cf and os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k, v in _empty_db().items():
-                data.setdefault(k, v)
-            return data
+                local_data = json.load(f)
+            for k, v in local_data.items():
+                if k in data:
+                    data[k] = v
+            logger.info("Loaded database from local JSON file.")
+
+            # যদি ক্লাউডফ্লেয়ার যুক্ত থাকে কিন্তু D1 খালি ছিল, তাহলে লোকাল ডাটা স্বয়ংক্রিয়ভাবে D1-এ আপলোড হবে (Auto-Migration)
+            if is_cf_enabled():
+                logger.info("☁️ Auto-migrating local database to Cloudflare D1...")
+                for sec, val in data.items():
+                    _cf_save_section_direct(sec, val)
         except Exception as e:
             logger.error(f"DB load error, starting fresh: {e}")
-    return _empty_db()
+
+    for k, v in _empty_db().items():
+        data.setdefault(k, v)
+    return data
 
 DB = _load_db()
 
-def save_db():
+def save_db(section=None):
     with _db_lock:
         os.makedirs(os.path.dirname(DATA_FILE) or ".", exist_ok=True)
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(DB, f, ensure_ascii=False, indent=2)
         os.replace(tmp, DATA_FILE)
+
+        # ক্লাউডফ্লেয়ারে ব্যাকগ্রাউন্ড সিঙ্কের জন্য ডার্টি সেকশন চিহ্নিত করা
+        if is_cf_enabled():
+            with _cf_sync_lock:
+                if section:
+                    _cf_dirty_sections.add(section)
+                else:
+                    for k in DB.keys():
+                        _cf_dirty_sections.add(k)
+            _cf_sync_event.set()
+
+def _cf_sync_worker():
+    """ব্যাকগ্রাউন্ডে ক্লাউডফ্লেয়ারে পরিবর্তিত সেকশনগুলো সেভ করে (বটের গতিতে কোনো প্রভাব ফেলে না)।"""
+    while True:
+        _cf_sync_event.wait(timeout=3)
+        _cf_sync_event.clear()
+        if not is_cf_enabled():
+            time.sleep(5)
+            continue
+
+        with _cf_sync_lock:
+            to_sync = list(_cf_dirty_sections)
+            _cf_dirty_sections.clear()
+
+        if not to_sync:
+            continue
+
+        for sec in to_sync:
+            with _db_lock:
+                val = DB.get(sec)
+            if val is not None:
+                res = _cf_save_section_direct(sec, val)
+                if res is None:
+                    # ব্যর্থ হলে পরবর্তী বারের জন্য তালিকায় ফিরিয়ে রাখা
+                    with _cf_sync_lock:
+                        _cf_dirty_sections.add(sec)
+            time.sleep(0.3)  # রেট লিমিট নিরাপদ রাখতে হালকা বিরতি
 
 # Owner কে সবসময় admins-এর মধ্যে ধরে নেওয়া হয়, ডাটাবেসে আলাদা করে রাখারও দরকার নেই।
 
@@ -570,6 +706,7 @@ def _owner_menu():
     m = _admin_menu()
     m.row(_btn("👑 Admin Requests", "menu_requests"), _btn("👥 Admin লিস্ট", "menu_admins"))
     m.row(_btn("📢 ব্রডকাস্ট", "menu_broadcast"), _btn("🔐 Protect Content", "toggle_protect"))
+    m.row(_btn("☁️ Cloudflare DB স্ট্যাটাস", "cf_status"))
     return m
 
 def _settings_menu(u):
@@ -844,6 +981,38 @@ def cb(call):
         new_val = toggle_setting("protect_content")
         bot.answer_callback_query(call.id, f"🔐 Protect Content এখন {'ON' if new_val else 'OFF'}", show_alert=True)
         _show_main_menu(cid, mid)
+
+    elif data == "cf_status":
+        if not is_owner(cid):
+            bot.answer_callback_query(call.id, "⛔ শুধু Owner!", show_alert=True); return
+        m = _mk(); m.add(_back("main_menu"))
+        if is_cf_enabled():
+            test_res = _cf_d1_query("SELECT count(*) as count FROM bot_sections;")
+            if test_res is not None:
+                cnt = test_res[0].get("count", 0) if test_res else 0
+                st_text = (
+                    f"☁️ <b>Cloudflare D1 ডাটাবেস স্ট্যাটাস</b>\n{'─'*30}\n"
+                    f"🟢 স্ট্যাটাস: <b>সফলভাবে সংযুক্ত (Connected)</b>\n"
+                    f"🆔 Account ID: <code>{CF_ACCOUNT_ID[:6]}...{CF_ACCOUNT_ID[-4:] if len(CF_ACCOUNT_ID)>4 else ''}</code>\n"
+                    f"📦 Database ID: <code>{CF_D1_DATABASE_ID[:6]}...{CF_D1_DATABASE_ID[-4:] if len(CF_D1_DATABASE_ID)>4 else ''}</code>\n"
+                    f"📁 ক্লাউডে সিঙ্ক হওয়া সেকশন: <b>{cnt}</b>টি\n\n"
+                    f"🎉 আপনার বটের সমস্ত ফাইল, ইউজার ও সেটিংস Render বন্ধ বা রিস্টার্ট হলেও <b>আজীবন সুরক্ষিত থাকবে</b>।"
+                )
+            else:
+                st_text = (
+                    "⚠️ <b>Cloudflare D1 কানেকশন ত্রুটি!</b>\n\n"
+                    "টোকেন বা ডাটাবেস আইডি সঠিক কিনা নিশ্চিত করুন। Render Environment Variables চেক করুন।"
+                )
+        else:
+            st_text = (
+                "🔴 <b>Cloudflare D1 সংযুক্ত নেই!</b>\n\n"
+                "বর্তমানে বটটি <b>লোকাল JSON ফাইল</b> ব্যবহার করছে। Render-এর ফ্রি সার্ভিসে রিস্টার্টের পর ডাটা মুছে যাওয়া রোধ করতে Cloudflare D1 যোগ করুন।\n\n"
+                "📌 <b>প্রয়োজনীয় ভেরিয়েবল (.env / Render):</b>\n"
+                "• <code>CF_ACCOUNT_ID</code>\n"
+                "• <code>CF_D1_DATABASE_ID</code>\n"
+                "• <code>CF_API_TOKEN</code>"
+            )
+        bot.edit_message_text(st_text, cid, mid, reply_markup=m)
 
     # ══ ফোর্স সাবস্ক্রাইব ══
     elif data == "menu_forcesub":
@@ -1530,4 +1699,5 @@ def _self_ping_worker():
 if __name__ == "__main__":
     threading.Thread(target=_run_keepalive_server, daemon=True).start()
     threading.Thread(target=_self_ping_worker, daemon=True).start()
+    threading.Thread(target=_cf_sync_worker, daemon=True).start()
     run_bot()

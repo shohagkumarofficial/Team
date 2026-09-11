@@ -41,17 +41,39 @@ Ad/Premium/Log চ্যানেল **শুধু Owner .env থেকে স�
 | `SHORTENER_API_BASE` | শর্টেনার API base URL (ডিফল্ট: `https://teraboxlinks.com/api`) |
 | `DATA_FILE` | ডাটাবেস JSON ফাইলের পাথ (ডিফল্ট: `data/database.json`) |
 | `PORT` | Render Web Service পোর্ট (ডিফল্ট: `8080`, Render নিজে সেট করে দেয়) |
+| `CF_ACCOUNT_ID` | Cloudflare Account ID (Cloudflare D1-এর জন্য) |
+| `CF_D1_DATABASE_ID` | Cloudflare D1 Database ID |
+| `CF_API_TOKEN` | Cloudflare API Token (D1 Edit পারমিশন সহ) |
 
 Chat ID বের করতে বটে `/myid` কমান্ড ব্যবহার করুন।
 
-## Render-এ ডিপ্লয়
+## Render-এ ডিপ্লয় ও ডাটাবেস স্থায়ী করা
 - **Build Command:** `pip install -r requirements.txt`
 - **Start Command:** `python shortenerbot.py`
-- একটা **Web Service** হিসেবেই ডিপ্লয় করা যাবে — বটের ভেতরে একটা হালকা keep-alive HTTP সার্ভার (Flask ছাড়া, built-in `http.server`) আছে যেটা health-check পাশ করাবে।
-- ⚠️ **গুরুত্বপূর্ণ:** Render-এর ফ্রি ডিস্ক ইফেমেরাল (ephemeral) — রিডিপ্লয় হলে `data/database.json` মুছে যেতে পারে। ডাটা স্থায়ীভাবে রাখতে Render Disk (Persistent Disk) অ্যাড-অন যোগ করুন এবং `DATA_FILE` env দিয়ে সেই disk-mount পাথ দেখিয়ে দিন (যেমন `/var/data/database.json`)।
+- একটা **Web Service** হিসেবে ডিপ্লয় করা যাবে — বটের ভেতরে হালকা keep-alive HTTP সার্ভার (UptimeRobot ও Self-Ping সাপোর্ট সহ) আছে।
+- ☁️ **ডাটাবেস স্থায়ী রাখতে Cloudflare D1 (১০০% ফ্রি):**
+  Render-এর ফ্রি সার্ভার রিস্টার্ট হলে লোকাল ফাইল মুছে যায়। কিন্তু **Cloudflare D1** ব্যবহার করলে বটের সমস্ত ফাইল, ইউজার ও সেটিংস আজীবন ক্লাউডে অক্ষত থাকবে।
 
-## প্রথমবার সেটআপ
-1. env var-এ নিজের Chat ID `MAIN_ADMIN_ID`-তে বসান — তাহলে বট চালু হলে আপনি অটোমেটিক Owner হয়ে যাবেন।
-2. `/start` দিন — Owner প্যানেল দেখবেন।
-3. যাকে Admin বানাতে চান, তাকে বটে `/start` দিতে বলুন → সে "🔑 Admin Access Request" চাপবে → আপনার কাছে Accept/Reject নোটিফিকেশন আসবে।
-4. Accept করলে সে Admin হয়ে যাবে এবং নিজের শর্টেনার API key সেট করে আর্নিং শুরু করতে পারবে।
+## Cloudflare D1 সেটাপ করার সহজ নিয়ম (প্রথমবার যারা করছেন)
+1. **Cloudflare একাউন্ট:** [dash.cloudflare.com](https://dash.cloudflare.com)-এ ফ্রি একাউন্ট খুলুন বা লগইন করুন।
+2. **D1 ডাটাবেস তৈরি:**
+   - বাম পাশের মেনু থেকে **Storage & Databases** → **D1 SQL Database**-এ যান।
+   - **Create database** বাটনে ক্লিক করুন।
+   - ডাটাবেসের একটি নাম দিন (যেমন: `shortenerbot-db`) এবং **Create** চাপুন।
+   - তৈরি হওয়ার পর স্ক্রিনে **Database ID** এবং **Account ID** দেখতে পাবেন। এগুলো কপি করে রাখুন।
+3. **API Token তৈরি:**
+   - ডানদিকের উপরে আপনার প্রোফাইল আইকন → **My Profile** → **API Tokens**-এ যান (অথবা [এখানে যান](https://dash.cloudflare.com/profile/api-tokens))।
+   - **Create Token** বাটনে ক্লিক করুন।
+   - নিচে স্ক্রল করে **Create Custom Token**-এর পাশে **Get started** দিন।
+   - **Token name:** যেকোনো নাম দিন (যেমন: `Bot-D1-Token`)।
+   - **Permissions:**
+     - প্রথম ড্রপডাউনে **Account**, দ্বিতীয়টিতে **D1**, তৃতীয়টিতে **Edit** সিলেক্ট করুন।
+   - নিচে **Continue to summary** → **Create Token** দিন।
+   - যে টোকেনটি দেখতে পাবেন সেটি কপি করে রাখুন (এটি আর পরে দেখা যাবে না)।
+4. **Render-এ ভেরিয়েবল যোগ:**
+   - Render ড্যাশবোর্ডে গিয়ে আপনার বটের **Environment** সেকশনে এই ৩টি ভেরিয়েবল যোগ করুন:
+     - `CF_ACCOUNT_ID` = আপনার Account ID
+     - `CF_D1_DATABASE_ID` = আপনার Database ID
+     - `CF_API_TOKEN` = আপনার API Token
+   - Save Changes দিলে Render বট রিস্টার্ট করবে এবং স্বয়ংক্রিয়ভাবে ডাটাবেস কানেক্ট হয়ে যাবে!
+5. **যাচাই করা:** বটে `/start` দিয়ে Owner প্যানেলে **☁️ Cloudflare DB স্ট্যাটাস** বাটনে ক্লিক করে কানেকশন সবুজ (Connected) দেখতে পাবেন।
