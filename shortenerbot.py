@@ -327,6 +327,22 @@ def _build_post_markup(user, link, share_text):
     mk.row(InlineKeyboardButton("🔗 শেয়ার করুন", url=f"https://t.me/share/url?url=&text={encoded}"))
     return mk
 
+def _build_copy_button(link):
+    mk = InlineKeyboardMarkup()
+    btn_added = False
+    try:
+        if hasattr(telebot.types, 'CopyTextButton'):
+            mk.add(InlineKeyboardButton("📋 এক ক্লিকে লিংক কপি করুন", copy_text=telebot.types.CopyTextButton(text=link)))
+            btn_added = True
+    except Exception as e:
+        logger.warning(f"CopyTextButton error: {e}")
+    if not btn_added:
+        try:
+            mk.add(InlineKeyboardButton("🔗 শেয়ার / কপি করুন", url=f"https://t.me/share/url?url={quote(link)}"))
+        except Exception:
+            pass
+    return mk
+
 def _send_media(ch_id, mtype, mid, caption, markup, protect=False, thumb_id=""):
     kw = {"caption": caption, "reply_markup": markup, "protect_content": protect}
     if thumb_id:
@@ -749,6 +765,10 @@ def cb(call):
         title = "" if data == "skip_title" else user.get("header", "")
         _finalize_post(cid, mid, title)
 
+    elif data == "skip_thumbnail":
+        bot.answer_callback_query(call.id)
+        _handle_thumbnail_received(cid, "", user)
+
     elif data == "post_now":
         pass  # ব্যবহৃত হয় না, রাখা হলো ভবিষ্যতের জন্য
 
@@ -974,21 +994,17 @@ def _handle_thumbnail_received(chat_id, thumb_id, user):
         "pending_link": file_key, "temp_thumb_id": thumb_id, "step": "wait_video_dl_link",
     })
 
-    m = _mk()
-    try:
-        m.add(InlineKeyboardButton("📋 এক ক্লিকে কপি করুন", copy_text=telebot.types.CopyTextButton(text=d_link)))
-    except Exception:
-        pass  # পুরনো টেলিগ্রাম ক্লায়েন্ট/লাইব্রেরিতে সাপোর্ট না থাকলে বাটন ছাড়াই এগোবে
-    try:
-        bot.send_message(chat_id, f"✅ থাম্বনেইল সেট হয়েছে!\n\n🔗 <b>বট শেয়ার লিংক:</b>\n<code>{d_link}</code>\n(কোড টেক্সটে ট্যাপ করলেও কপি হয়ে যাবে)", reply_markup=m)
-    except Exception:
-        bot.send_message(chat_id, f"✅ থাম্বনেইল সেট হয়েছে!\n\n🔗 <b>বট শেয়ার লিংক:</b>\n<code>{d_link}</code>")
-
-    bot.send_message(
-        chat_id,
-        "📥 এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।\n"
-        "(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে লিংক পাবেন, সেটাই এখানে পাঠান — এটাই Ads চ্যানেলে পোস্ট হবে)"
+    m = _build_copy_button(d_link)
+    header_txt = "✅ <b>থাম্বনেইল সেট হয়েছে!</b>" if thumb_id else "✅ <b>ভিডিও সংরক্ষিত হয়েছে!</b>"
+    msg_txt = (
+        f"{header_txt}\n\n"
+        f"🔗 <b>ফাইল স্টোর / বট শেয়ার লিংক:</b>\n"
+        f"<code>{d_link}</code>\n"
+        f"<i>(কোড লিংকে বা নিচের বাটনে ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
+        f"📥 <b>এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।</b>\n"
+        f"(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই চ্যানেলের ডাউনলোড বাটনে যাবে)"
     )
+    bot.send_message(chat_id, msg_txt, reply_markup=m)
 
 def _handle_download_link_received(chat_id, link_text, user):
     """ভিডিও-স্পেশাল ফ্লো ধাপ ৩: শর্টেনার লিংক পাওয়া গেলে Ads চ্যানেলগুলোতে অটো-পোস্ট।"""
@@ -1065,12 +1081,21 @@ def _handle_generic_dl_link_received(chat_id, link_text, user):
 
 def _ask_title(chat_id, mid, batch_id, count):
     update_user(chat_id, {"pending_link": batch_id})
+    d_link = f"https://t.me/{BOT_USERNAME}?start={batch_id}"
     m = _mk()
     m.row(_btn("⏭️ Skip (কোনো শিরোনাম না)", "skip_title"), _btn("📝 Header ব্যবহার করুন", "use_header_title"))
-    try:
-        bot.edit_message_text(f"✅ <b>{count}টি ফাইল সেভ হয়েছে!</b>\n\nএই পোস্টের জন্য শিরোনাম লিখে পাঠান, অথবা নিচের বাটন ব্যবহার করুন:", chat_id, mid, reply_markup=m)
-    except Exception:
-        bot.send_message(chat_id, f"✅ <b>{count}টি ফাইল সেভ হয়েছে!</b>\n\nএই পোস্টের জন্য শিরোনাম লিখে পাঠান, অথবা নিচের বাটন ব্যবহার করুন:", reply_markup=m)
+    text = (
+        f"✅ <b>{count}টি ফাইল সেভ হয়েছে!</b>\n\n"
+        f"🔗 <b>ফাইল স্টোর লিংক:</b>\n<code>{d_link}</code>\n\n"
+        f"এই পোস্টের জন্য শিরোনাম লিখে পাঠান, অথবা নিচের বাটন ব্যবহার করুন:"
+    )
+    if mid:
+        try:
+            bot.edit_message_text(text, chat_id, mid, reply_markup=m)
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, reply_markup=m)
     update_step(chat_id, "wait_post_title")
 
 def _finalize_post(chat_id, mid, title):
@@ -1091,11 +1116,26 @@ def _finalize_post(chat_id, mid, title):
     thumb_id = files[0].get('thumb_id', '')
 
     update_user(chat_id, {"post_title": title, "temp_media_id": mid_, "temp_media_type": mtype, "temp_thumb_id": thumb_id, "step": "wait_post_dl_link"})
-    text_out = "✅ টাইটেল সেভ হয়েছে!\n\n📥 এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।\n(বটের শেয়ার লিংক শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই Ads চ্যানেলের ডাউনলোড বাটনে যাবে)"
-    try:
-        bot.edit_message_text(text_out, chat_id, mid)
-    except Exception:
-        bot.send_message(chat_id, text_out)
+
+    d_link = f"https://t.me/{BOT_USERNAME}?start={bid}"
+    m = _build_copy_button(d_link)
+
+    title_info = f"\n📝 <b>শিরোনাম:</b> {clean_html(title)}" if title else ""
+    text_out = (
+        f"✅ <b>টাইটেল সেভ হয়েছে!</b>{title_info}\n\n"
+        f"🔗 <b>ফাইল স্টোর / বট শেয়ার লিংক:</b>\n"
+        f"<code>{d_link}</code>\n"
+        f"<i>(কোড লিংকে বা নিচের বাটনে ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
+        f"📥 <b>এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।</b>\n"
+        f"(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই চ্যানেলের ডাউনলোড বাটনে যাবে)"
+    )
+    if mid:
+        try:
+            bot.edit_message_text(text_out, chat_id, mid, reply_markup=m)
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text_out, reply_markup=m)
 
 # ══════════════════════════════════════════════════
 #  মেসেজ হ্যান্ডলার (টেক্সট + ফাইল)
@@ -1242,7 +1282,9 @@ def handle_message(message):
         # ভিডিও একক আপলোড হলে — আগে থাম্বনেইল ও ম্যানুয়াল ডাউনলোড লিংক চাওয়া হবে
         if mtype == 'video' and step in ("wait_single", "none"):
             update_user(chat_id, {"temp_media_id": file_id, "temp_media_type": mtype, "step": "wait_thumbnail"})
-            bot.send_message(chat_id, "🖼️ এখন এই ভিডিওর জন্য একটি ছবি থাম্বনেইল হিসেবে পাঠান:")
+            m = _mk()
+            m.add(_btn("⏭️ Skip (থাম্বনেইল ছাড়া)", "skip_thumbnail"))
+            bot.send_message(chat_id, "🖼️ এখন এই ভিডিওর জন্য একটি ছবি থাম্বনেইল হিসেবে পাঠান (অথবা নিচের বাটনে Skip করুন):", reply_markup=m)
             return
 
         if step in ("wait_single", "none"):
