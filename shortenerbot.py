@@ -282,6 +282,7 @@ _DEFAULTS = {
     "pending_link": "", "pending_short_link": "",
     "_adch_name": "",
     "_btn_text": "",
+    "custom_buttons_enabled": 1,
     "joined_at": "", "last_active": "",
     "total_downloads": 0, "total_uploads": 0,
 }
@@ -327,8 +328,23 @@ def all_admins():
 # ══════════════════════════════════════════════════
 #  Ads চ্যানেল (env-ফিক্সড + Admin-দের বট থেকে যোগ করা)
 # ══════════════════════════════════════════════════
+def get_admin_ad_channel_ids(admin_id):
+    """
+    নির্দিষ্ট admin-এর চ্যানেলগুলো ফেরত দেয়:
+    - যদি owner হয়: env-এর AD_CHANNEL_IDS + owner-এর বট থেকে যোগ করা চ্যানেল।
+    - যদি সাধারণ admin হয়: শুধুমাত্র ওই admin-এর নিজস্ব যোগ করা চ্যানেল।
+    """
+    aid_str = str(admin_id)
+    admin_added = [
+        c.get("channel_id") for c in DB.get("ad_channels", {}).values()
+        if c.get("channel_id") and str(c.get("added_by", MAIN_ADMIN_ID)) == aid_str
+    ]
+    if is_owner(aid_str):
+        return list(dict.fromkeys(AD_CHANNEL_IDS + admin_added))
+    return list(dict.fromkeys(admin_added))
+
 def all_ad_channel_ids():
-    """env-এর ফিক্সড AD_CHANNEL_IDS + Admin-রা বট থেকে যোগ করা চ্যানেল — ডুপ্লিকেট বাদে।"""
+    """বটের সমস্ত Ads চ্যানেল (সব এডমিন সহ) — গ্লোবাল কাউন্ট বা তথ্যের জন্য।"""
     extra = [c.get("channel_id") for c in DB.get("ad_channels", {}).values() if c.get("channel_id")]
     return list(dict.fromkeys(AD_CHANNEL_IDS + extra))
 
@@ -358,8 +374,14 @@ def get_stats():
 # ══════════════════════════════════════════════════
 #  ফোর্স সাবস্ক্রাইব (Owner + Admin দুজনেই ম্যানেজ করতে পারবে)
 # ══════════════════════════════════════════════════
-def check_force_sub(chat_id):
-    chs = [c for c in DB["force_sub"].values() if c.get("status") == "on"]
+def check_force_sub(chat_id, required_admin_id=None):
+    valid_admins = {MAIN_ADMIN_ID}
+    if required_admin_id:
+        valid_admins.add(str(required_admin_id))
+    chs = [
+        c for c in DB.get("force_sub", {}).values()
+        if c.get("status") == "on" and (str(c.get("added_by", MAIN_ADMIN_ID)) in valid_admins)
+    ]
     if not chs: return True, []
     not_joined = []
     for ch in chs:
@@ -464,10 +486,12 @@ def _build_post_markup(user, link, share_text):
     encoded = quote(share_text, safe='')
     mk.row(InlineKeyboardButton("🔗 শেয়ার করুন", url=f"https://t.me/share/url?url=&text={encoded}"))
 
-    # কাস্টম বাটন (যদি মাস্টার সুইচ ON থাকে এবং বাটনের স্ট্যাটাস ON থাকে)
-    if get_setting("custom_buttons_enabled", 1):
+    # কাস্টম বাটন (যদি এই ইউজারের কাস্টম বাটন চালু থাকে এবং বাটনের স্ট্যাটাস ON থাকে)
+    uploader_id = str(user.get("chat_id", ""))
+    if user.get("custom_buttons_enabled", 1):
         for btn in DB.get("custom_buttons", {}).values():
-            if btn.get("status") == "on" and btn.get("text") and btn.get("url"):
+            btn_owner = str(btn.get("added_by", MAIN_ADMIN_ID))
+            if btn_owner == uploader_id and btn.get("status") == "on" and btn.get("text") and btn.get("url"):
                 mk.row(InlineKeyboardButton(btn["text"], url=btn["url"]))
 
     return mk
@@ -580,7 +604,8 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short
     else:
         terabox_key = user.get("terabox_key", "")
         short_link = get_short_link(d_link, terabox_key)
-        if not terabox_key and all_ad_channel_ids():
+        ad_channel_ids = get_admin_ad_channel_ids(admin_id)
+        if not terabox_key and ad_channel_ids:
             try:
                 bot.send_message(admin_id, "⚠️ আপনার TeraBox/শর্টেনার API key সেট করা নেই — আপাতত সরাসরি লিংক ব্যবহার হচ্ছে, আর্নিং হবে না।\n🔧 সেট করতে: ⚙️ সেটিংস → 🔗 শর্টেনার Key")
             except Exception:
@@ -590,9 +615,10 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short
     posted = 0
 
     # Ad চ্যানেল — monetized short link
+    ad_channel_ids = get_admin_ad_channel_ids(admin_id)
     ad_caption = f"{ph_t}{fc_txt}⬇️ ডাউনলোড করতে নিচের বাটনে ক্লিক করুন\n\n<i>🕐 {now_str}</i>{pf_t}".strip()
     ad_markup = _build_post_markup(user, short_link, clean_html(ad_caption))
-    for ch_id in all_ad_channel_ids():
+    for ch_id in ad_channel_ids:
         try:
             _send_media(ch_id, mtype, mid, ad_caption, ad_markup, protect, thumb_id)
             posted += 1
@@ -762,7 +788,14 @@ def cmd_start(message):
     payload = parts[1].strip() if len(parts) > 1 else ""
 
     if not is_admin(chat_id):  # Owner/Admin দের ফোর্স-সাব লাগবে না
-        ok, not_joined = check_force_sub(chat_id)
+        uploader_id = None
+        if payload and not payload.startswith("ref_"):
+            files = [f for f in DB["files"].values() if f.get("file_key") == payload or f.get("batch_id") == payload]
+            if files:
+                uploader_id = files[0].get("uploader")
+        elif payload.startswith("ref_"):
+            uploader_id = payload[4:]
+        ok, not_joined = check_force_sub(chat_id, required_admin_id=uploader_id)
         if not ok:
             send_force_sub_msg(chat_id, not_joined, payload or None)
             return
@@ -806,7 +839,15 @@ def cb(call):
 
     if data.startswith("check_sub_"):
         fk = data[10:]
-        joined, nj = check_force_sub(cid)
+        uploader_id = None
+        if fk and fk != "none":
+            if fk.startswith("ref_"):
+                uploader_id = fk[4:]
+            else:
+                files = [f for f in DB["files"].values() if f.get("file_key") == fk or f.get("batch_id") == fk]
+                if files:
+                    uploader_id = files[0].get("uploader")
+        joined, nj = check_force_sub(cid, required_admin_id=uploader_id)
         if joined:
             bot.answer_callback_query(call.id, "✅ Join নিশ্চিত হয়েছে!", show_alert=True)
             try: bot.delete_message(cid, mid)
@@ -1017,11 +1058,23 @@ def cb(call):
     # ══ ফোর্স সাবস্ক্রাইব ══
     elif data == "menu_forcesub":
         m = _mk()
-        for fs_id, ch in DB["force_sub"].items():
-            m.row(_btn(f"📢 {ch['name']} {_ico(ch.get('status')=='on')}", f"fs_toggle_{fs_id}"), _btn("🗑️", f"fs_del_{fs_id}"))
+        all_fs = DB.get("force_sub", {})
+        if is_owner(cid):
+            fs_list = all_fs
+        else:
+            fs_list = {k: v for k, v in all_fs.items() if str(v.get("added_by", MAIN_ADMIN_ID)) == str(cid)}
+
+        for fs_id, ch in fs_list.items():
+            adder = ch.get("added_by", MAIN_ADMIN_ID)
+            tag = f" (👤 {adder})" if is_owner(cid) and not is_owner(adder) else ""
+            m.row(_btn(f"📢 {ch['name']}{tag} {_ico(ch.get('status')=='on')}", f"fs_toggle_{fs_id}"), _btn("🗑️", f"fs_del_{fs_id}"))
         m.add(_btn("➕ নতুন চ্যানেল যোগ করুন", "fs_add"))
         m.add(_back("main_menu"))
-        bot.edit_message_text("🔒 <b>ফোর্স সাবস্ক্রাইব চ্যানেল</b>", cid, mid, reply_markup=m)
+        if is_owner(cid):
+            hdr_text = f"🔒 <b>ফোর্স সাবস্ক্রাইব চ্যানেল (Owner ভিউ)</b>\n\nমোট চ্যানেল: <b>{len(fs_list)}</b>টি"
+        else:
+            hdr_text = f"🔒 <b>আপনার ফোর্স সাবস্ক্রাইব চ্যানেল</b>\n\n➕ আপনার যোগকৃত চ্যানেল: <b>{len(fs_list)}</b>টি\n<i>(আপনার ফাইল ডাউনলোড করার আগে ইউজারদের এই চ্যানেলে জয়েন করতে হবে)</i>"
+        bot.edit_message_text(hdr_text, cid, mid, reply_markup=m)
 
     elif data == "fs_add":
         update_step(cid, "wait_fs_name")
@@ -1029,29 +1082,50 @@ def cb(call):
 
     elif data.startswith("fs_toggle_"):
         fs_id = data[10:]
-        ch = DB["force_sub"].get(fs_id)
+        ch = DB.get("force_sub", {}).get(fs_id)
         if ch:
+            if not is_owner(cid) and str(ch.get("added_by", MAIN_ADMIN_ID)) != str(cid):
+                bot.answer_callback_query(call.id, "⛔ আপনি শুধু আপনার নিজের চ্যানেল পরিবর্তন করতে পারবেন!", show_alert=True); return
             ch["status"] = "off" if ch.get("status") == "on" else "on"
             save_db()
         call.data = "menu_forcesub"; cb(call)
 
     elif data.startswith("fs_del_"):
         fs_id = data[7:]
-        with _db_lock:
-            DB["force_sub"].pop(fs_id, None); save_db()
+        ch = DB.get("force_sub", {}).get(fs_id)
+        if ch:
+            if not is_owner(cid) and str(ch.get("added_by", MAIN_ADMIN_ID)) != str(cid):
+                bot.answer_callback_query(call.id, "⛔ আপনি শুধু আপনার নিজের চ্যানেল মুছে ফেলতে পারবেন!", show_alert=True); return
+            with _db_lock:
+                DB.get("force_sub", {}).pop(fs_id, None); save_db()
+            bot.answer_callback_query(call.id, "🗑️ চ্যানেল মুছে ফেলা হয়েছে!", show_alert=True)
         call.data = "menu_forcesub"; cb(call)
 
     # ══ Ads চ্যানেল (Admin/Owner — বট থেকে যোগ/রিমুভ) ══
     elif data == "menu_adchannels":
         m = _mk()
-        for a_id, ch in DB.get("ad_channels", {}).items():
-            m.row(_btn(f"📢 {ch.get('name','(নামহীন)')}", "noop"), _btn("🗑️", f"adch_del_{a_id}"))
-        m.add(_btn("➕ নতুন Ads চ্যানেল যোগ করুন", "adch_add"))
-        m.add(_back("main_menu"))
-        bot.edit_message_text(
-            f"📢 <b>Ads চ্যানেল</b>\n\n🔒 ফিক্সড (env, শুধু Owner বদলাতে পারবে): <b>{len(AD_CHANNEL_IDS)}</b>টি\n➕ Admin-যোগকৃত (বট থেকে): <b>{len(DB.get('ad_channels', {}))}</b>টি",
-            cid, mid, reply_markup=m
-        )
+        all_chs = DB.get("ad_channels", {})
+        if is_owner(cid):
+            for a_id, ch in all_chs.items():
+                adder = ch.get("added_by", MAIN_ADMIN_ID)
+                tag = " (👑 Owner)" if is_owner(adder) else f" (👤 {adder})"
+                m.row(_btn(f"📢 {ch.get('name','(নামহীন)')}{tag}", "noop"), _btn("🗑️", f"adch_del_{a_id}"))
+            m.add(_btn("➕ নতুন Ads চ্যানেল যোগ করুন", "adch_add"))
+            m.add(_back("main_menu"))
+            bot.edit_message_text(
+                f"📢 <b>Ads চ্যানেল ম্যানেজমেন্ট (Owner ভিউ)</b>\n\n🔒 ফিক্সড (env): <b>{len(AD_CHANNEL_IDS)}</b>টি\n➕ সমস্ত Admin-যোগকৃত: <b>{len(all_chs)}</b>টি",
+                cid, mid, reply_markup=m
+            )
+        else:
+            my_chs = {a_id: ch for a_id, ch in all_chs.items() if str(ch.get("added_by", MAIN_ADMIN_ID)) == str(cid)}
+            for a_id, ch in my_chs.items():
+                m.row(_btn(f"📢 {ch.get('name','(নামহীন)')}", "noop"), _btn("🗑️", f"adch_del_{a_id}"))
+            m.add(_btn("➕ নতুন Ads চ্যানেল যোগ করুন", "adch_add"))
+            m.add(_back("main_menu"))
+            bot.edit_message_text(
+                f"📢 <b>আপনার Ads চ্যানেল</b>\n\n➕ আপনার যোগকৃত চ্যানেল: <b>{len(my_chs)}</b>টি\n<i>(আপনার আপলোড করা ফাইলগুলো শুধুমাত্র আপনার এই চ্যানেলগুলোতে পোস্ট হবে)</i>",
+                cid, mid, reply_markup=m
+            )
 
     elif data == "adch_add":
         update_step(cid, "wait_adch_name")
@@ -1059,21 +1133,32 @@ def cb(call):
 
     elif data.startswith("adch_del_"):
         a_id = data[9:]
-        with _db_lock:
-            DB.get("ad_channels", {}).pop(a_id, None); save_db()
+        ch = DB.get("ad_channels", {}).get(a_id)
+        if ch:
+            if not is_owner(cid) and str(ch.get("added_by", MAIN_ADMIN_ID)) != str(cid):
+                bot.answer_callback_query(call.id, "⛔ আপনি শুধু আপনার নিজের চ্যানেল ডিলিট করতে পারবেন!", show_alert=True); return
+            with _db_lock:
+                DB.get("ad_channels", {}).pop(a_id, None); save_db()
+            bot.answer_callback_query(call.id, "🗑️ চ্যানেল মুছে ফেলা হয়েছে!", show_alert=True)
         call.data = "menu_adchannels"; cb(call)
 
     # ══ কাস্টম বাটন (Admin/Owner — যোগ, ডিলিট, অন/অফ) ══
     elif data == "menu_buttons":
         m = _mk()
-        master_on = bool(get_setting("custom_buttons_enabled", 1))
+        master_on = bool(user.get("custom_buttons_enabled", 1))
         m.add(_btn(f"মাস্টার সুইচ: {'🟢 চালু' if master_on else '🔴 বন্ধ'}", "btn_master_toggle"))
 
-        buttons = DB.get("custom_buttons", {})
+        all_buttons = DB.get("custom_buttons", {})
+        if is_owner(cid):
+            buttons = all_buttons
+        else:
+            buttons = {b_id: btn for b_id, btn in all_buttons.items() if str(btn.get("added_by", MAIN_ADMIN_ID)) == str(cid)}
+
         for b_id, btn in buttons.items():
             st_ico = _ico(btn.get("status") == "on")
+            creator_tag = f" (👤 {btn.get('added_by')})" if is_owner(cid) and str(btn.get('added_by', MAIN_ADMIN_ID)) != str(cid) else ""
             m.row(
-                _btn(f"{st_ico} {btn.get('text', '(নামহীন)')}", f"btn_toggle_{b_id}"),
+                _btn(f"{st_ico} {btn.get('text', '(নামহীন)')}{creator_tag}", f"btn_toggle_{b_id}"),
                 _btn("🗑️", f"btn_del_{b_id}")
             )
         m.add(_btn("➕ নতুন বাটন যোগ করুন", "btn_add"))
@@ -1083,13 +1168,15 @@ def cb(call):
         bot.edit_message_text(
             f"🔘 <b>কাস্টম পোস্ট বাটন ম্যানেজমেন্ট</b>\n\n"
             f"প্রতিটি পোস্টের নিচে এই বাটনগুলো যুক্ত হবে (যেমন: ব্যাকআপ চ্যানেল, ওয়েবসাইট, টিউটোরিয়াল)।\n\n"
-            f"📊 মোট বাটন: <b>{total}</b>টি | সক্রিয়: <b>{active}</b>টি\n"
+            f"📊 {'আপনার মোট বাটন' if not is_owner(cid) else 'মোট বাটন'}: <b>{total}</b>টি | সক্রিয়: <b>{active}</b>টি\n"
             f"💡 অন/অফ করতে বাটনের নামের উপর ক্লিক করুন।",
             cid, mid, reply_markup=m
         )
 
     elif data == "btn_master_toggle":
-        new_val = toggle_setting("custom_buttons_enabled")
+        cur = user.get("custom_buttons_enabled", 1)
+        new_val = 0 if cur else 1
+        update_user(cid, {"custom_buttons_enabled": new_val})
         bot.answer_callback_query(call.id, f"কাস্টম বাটন এখন {'🟢 চালু' if new_val else '🔴 বন্ধ'}", show_alert=True)
         call.data = "menu_buttons"; cb(call)
 
@@ -1097,6 +1184,8 @@ def cb(call):
         b_id = data[11:]
         btn = DB.get("custom_buttons", {}).get(b_id)
         if btn:
+            if not is_owner(cid) and str(btn.get("added_by", MAIN_ADMIN_ID)) != str(cid):
+                bot.answer_callback_query(call.id, "⛔ আপনি শুধু আপনার নিজের বাটন পরিবর্তন করতে পারবেন!", show_alert=True); return
             btn["status"] = "off" if btn.get("status") == "on" else "on"
             save_db()
             st = "🟢 চালু" if btn["status"] == "on" else "🔴 বন্ধ"
@@ -1105,9 +1194,13 @@ def cb(call):
 
     elif data.startswith("btn_del_"):
         b_id = data[8:]
-        with _db_lock:
-            DB.get("custom_buttons", {}).pop(b_id, None); save_db()
-        bot.answer_callback_query(call.id, "🗑️ বাটন মুছে ফেলা হয়েছে!", show_alert=True)
+        btn = DB.get("custom_buttons", {}).get(b_id)
+        if btn:
+            if not is_owner(cid) and str(btn.get("added_by", MAIN_ADMIN_ID)) != str(cid):
+                bot.answer_callback_query(call.id, "⛔ আপনি শুধু আপনার নিজের বাটন মুছে ফেলতে পারবেন!", show_alert=True); return
+            with _db_lock:
+                DB.get("custom_buttons", {}).pop(b_id, None); save_db()
+            bot.answer_callback_query(call.id, "🗑️ বাটন মুছে ফেলা হয়েছে!", show_alert=True)
         call.data = "menu_buttons"; cb(call)
 
     elif data == "btn_add":
@@ -1257,7 +1350,7 @@ def _handle_download_link_received(chat_id, link_text, user):
         update_user(chat_id, {"step": "none", "pending_link": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": ""})
         return
 
-    ad_ids = all_ad_channel_ids()
+    ad_ids = get_admin_ad_channel_ids(chat_id)
     if not ad_ids:
         bot.send_message(chat_id, "⚠️ কোনো Ads চ্যানেল যোগ করা নেই। আগে 📢 Ads চ্যানেল মেনু থেকে একটি যোগ করুন, তারপর আবার লিংকটি পাঠান।")
         return
@@ -1301,7 +1394,7 @@ def _handle_generic_dl_link_received(chat_id, link_text, user):
         update_user(chat_id, {"step": "none", "pending_link": "", "post_title": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": ""})
         return
 
-    ad_ids = all_ad_channel_ids()
+    ad_ids = get_admin_ad_channel_ids(chat_id)
     if not ad_ids:
         bot.send_message(chat_id, "⚠️ কোনো Ads চ্যানেল যোগ করা নেই। আগে 📢 Ads চ্যানেল মেনু থেকে একটি যোগ করুন, তারপর আবার লিংকটি পাঠান।")
         return
@@ -1345,7 +1438,7 @@ def _finalize_post(chat_id, mid, title):
         update_user(chat_id, {"step": "none"})
         return
 
-    if not all_ad_channel_ids():
+    if not get_admin_ad_channel_ids(chat_id):
         bot.send_message(chat_id, "⚠️ কোনো Ads চ্যানেল যোগ করা নেই। আগে 📢 Ads চ্যানেল মেনু থেকে একটি যোগ করুন, তারপর আবার আপলোড করুন।")
         update_user(chat_id, {"step": "none"})
         return
@@ -1434,7 +1527,14 @@ def handle_message(message):
     if step == "wait_fs_url" and text:
         fs_id = str(uuid.uuid4().hex)[:8]
         with _db_lock:
-            DB["force_sub"][fs_id] = {"fs_id": fs_id, "name": user.get("_fs_name", ""), "channel_id": user.get("_fs_channelid", ""), "url": text, "status": "on"}
+            DB["force_sub"][fs_id] = {
+                "fs_id": fs_id,
+                "name": user.get("_fs_name", ""),
+                "channel_id": user.get("_fs_channelid", ""),
+                "url": text,
+                "status": "on",
+                "added_by": chat_id,
+            }
             save_db()
         update_user(chat_id, {"step": "none", "_fs_name": "", "_fs_channelid": ""})
         bot.send_message(chat_id, "✅ ফোর্স-সাব চ্যানেল যোগ হয়েছে।"); return
