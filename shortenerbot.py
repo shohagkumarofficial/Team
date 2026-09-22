@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 try:
     from PIL import Image
     _PIL_OK = True
@@ -46,6 +47,7 @@ DATA_FILE   = os.environ.get("DATA_FILE", os.path.join(os.path.dirname(__file__)
 BOT_VERSION = "7.0.0"
 
 bot = telebot.TeleBot(BOT_TOKEN or "DUMMY_TOKEN", parse_mode="HTML")
+_is_webhook_mode = False
 
 # ══════════════════════════════════════════════════
 #  Cloudflare D1 ও JSON ডাটাবেস
@@ -938,8 +940,18 @@ def cb(call):
 
     elif data == "show_stats":
         s = get_stats(); m = _mk(); m.add(_back("main_menu"))
+        mode_txt = "⚡ Webhook (ব্যান্ডউইথ সুরক্ষিত)" if _is_webhook_mode else "🔄 Polling"
         bot.edit_message_text(
-            f"📊 <b>বট স্ট্যাটিস্টিক্স</b>\n{'─'*26}\n👥 মোট ইউজার   : <b>{s['total_users']}</b>\n🟢 আজ সক্রিয়   : <b>{s['active_today']}</b>\n📁 মোট ফাইল    : <b>{s['total_files']}</b>\n📥 আজ ডাউনলোড : <b>{s['dl_today']}</b>\n📤 আজ আপলোড   : <b>{s['ul_today']}</b>\n👑 এডমিন       : <b>{s['total_admins']}</b>\n{'─'*26}\n📤 আপনার আপলোড: <b>{user.get('total_uploads',0)}</b>",
+            f"📊 <b>বট স্ট্যাটিস্টিক্স</b>\n{'─'*26}\n"
+            f"👥 মোট ইউজার   : <b>{s['total_users']}</b>\n"
+            f"🟢 আজ সক্রিয়   : <b>{s['active_today']}</b>\n"
+            f"📁 মোট ফাইল    : <b>{s['total_files']}</b>\n"
+            f"📥 আজ ডাউনলোড : <b>{s['dl_today']}</b>\n"
+            f"📤 আজ আপলোড   : <b>{s['ul_today']}</b>\n"
+            f"👑 এডমিন       : <b>{s['total_admins']}</b>\n"
+            f"📡 মোড         : <b>{mode_txt}</b>\n"
+            f"{'─'*26}\n"
+            f"📤 আপনার আপলোড: <b>{user.get('total_uploads',0)}</b>",
             cid, mid, reply_markup=m
         )
 
@@ -1759,53 +1771,99 @@ def _broadcast_worker(admin_id, from_chat, msg_id, targets):
 # ══════════════════════════════════════════════════
 #  বট রান
 # ══════════════════════════════════════════════════
-def run_bot():
-    if not BOT_TOKEN or BOT_TOKEN == "DUMMY_TOKEN":
-        logger.error("❌ BOT_TOKEN সেট করা নেই! Polling শুরু করা যায়নি।")
-        return
-    if not all_ad_channel_ids() and not PREMIUM_CHANNEL_IDS:
-        logger.warning("⚠️ AD_CHANNEL_IDS / PREMIUM_CHANNEL_IDS সেট করা নেই — পোস্ট কোথাও যাবে না।")
-
-    # স্টার্টের আগে যেকোনো webhook/পুরনো getUpdates session ক্লিয়ার করে দেওয়া হলো —
-    # এটা "409 Conflict: terminated by other getUpdates request" এরর অনেকটা কমাতে সাহায্য করে,
-    # বিশেষ করে Render রিডিপ্লয়ের সময় সাময়িক ওভারল্যাপে।
+def _run_polling():
+    global _is_webhook_mode
+    _is_webhook_mode = False
     try:
         bot.remove_webhook()
         time.sleep(1)
-    except Exception as e:
-        logger.warning(f"remove_webhook ব্যর্থ (ignore করা হলো): {e}")
-
+    except Exception:
+        pass
     logger.info(f"🚀 Bot Polling started (v{BOT_VERSION})...")
     while True:
         try:
-            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60, skip_pending=True)
-        except telebot.apihelper.ApiTelegramException as e:
-            if getattr(e, "error_code", None) == 409:
-                logger.error("⚠️ 409 Conflict: একই BOT_TOKEN দিয়ে অন্য কোথাও (আরেকটা ইন্সট্যান্স/পুরনো ডিপ্লয়) polling চলছে। "
-                             "নিশ্চিত করুন Render-এ শুধু একটাই ইন্সট্যান্স/ডিপ্লয় চলছে এবং লোকালি বা অন্য কোথাও একই টোকেন চালু নেই।")
-            else:
-                logger.error(f"Polling error: {e}")
-            time.sleep(8)
+            bot.infinity_polling(timeout=90, long_polling_timeout=30, skip_pending=True)
         except Exception as e:
             logger.error(f"Polling error: {e}")
             time.sleep(5)
 
-# ══════════════════════════════════════════════════
-#  UptimeRobot ও Web Service এর জন্য Keep-Alive সার্ভার + Self Ping
-# ══════════════════════════════════════════════════
-class _PingHandler(BaseHTTPRequestHandler):
-    def _send_ok(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(b"OK - Bot is running")))
-        self.end_headers()
+def run_bot():
+    global _is_webhook_mode
+    if not BOT_TOKEN or BOT_TOKEN == "DUMMY_TOKEN":
+        logger.error("❌ BOT_TOKEN সেট করা নেই!")
+        return
 
-    def do_GET(self):
-        self._send_ok()
-        self.wfile.write(b"OK - Bot is running")
+    # Render বা কাস্টম এনভায়রনমেন্ট থেকে পাবলিক URL সংগ্রহ
+    base_url = (os.environ.get("RENDER_EXTERNAL_URL") or 
+                os.environ.get("WEBHOOK_URL") or 
+                os.environ.get("APP_URL") or "").strip()
+
+    if base_url:
+        if not base_url.startswith("http://") and not base_url.startswith("https://"):
+            base_url = f"https://{base_url}"
+        base_url = base_url.rstrip("/")
+        webhook_url = f"{base_url}/webhook/{BOT_TOKEN}"
+
+        logger.info(f"🔗 Setting Telegram Webhook: {base_url}/webhook/***")
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            res = bot.set_webhook(url=webhook_url, drop_pending_updates=False)
+            if res:
+                _is_webhook_mode = True
+                logger.info("⚡ Telegram Webhook successfully activated! (Bandwidth usage reduced by 99%)")
+                while True:
+                    time.sleep(3600)
+            else:
+                logger.warning("⚠️ Failed to set webhook, falling back to Polling.")
+                _run_polling()
+        except Exception as e:
+            logger.error(f"Webhook setup error: {e}, falling back to Polling.")
+            _run_polling()
+    else:
+        logger.info("ℹ️ No public URL detected (RENDER_EXTERNAL_URL not set). Running in Polling mode...")
+        _run_polling()
+
+# ══════════════════════════════════════════════════
+#  UptimeRobot ও Web Service এর জন্য Webhook + Keep-Alive সার্ভার
+# ══════════════════════════════════════════════════
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+class _WebhookHandler(BaseHTTPRequestHandler):
+    def _send_response(self, code, text):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        body = text.encode("utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_HEAD(self):
-        self._send_ok()
+        self._send_response(200, "OK")
+
+    def do_GET(self):
+        # UptimeRobot / Render Health Check / Self-ping
+        self._send_response(200, "OK - Bot is running (Webhook Mode)")
+
+    def do_POST(self):
+        # Webhook আপডেট হ্যান্ডলার
+        token_path = f"/webhook/{BOT_TOKEN}"
+        if self.path == token_path or self.path == "/webhook" or self.path == "/":
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                body = self.rfile.read(content_length).decode('utf-8')
+                try:
+                    update_dict = json.loads(body)
+                    update = telebot.types.Update.de_json(update_dict)
+                    if update:
+                        threading.Thread(target=bot.process_new_updates, args=([update],), daemon=True).start()
+                except Exception as e:
+                    logger.error(f"Webhook update processing error: {e}")
+            self._send_response(200, "OK")
+        else:
+            self._send_response(404, "Not Found")
 
     def log_message(self, *args):
         pass  # সার্ভার কনসোল লগ পরিষ্কার রাখতে চেপে রাখা হলো
@@ -1819,27 +1877,21 @@ def _get_port():
 def _run_keepalive_server():
     port = _get_port()
     try:
-        server = HTTPServer(("0.0.0.0", port), _PingHandler)
-        logger.info(f"🌐 Keep-alive server running on port {port}")
+        server = _ThreadingHTTPServer(("0.0.0.0", port), _WebhookHandler)
+        logger.info(f"🌐 Webhook & Keep-alive server running on port {port}")
         server.serve_forever()
     except Exception as e:
         logger.warning(f"Keep-alive server error on port {port}: {e}")
 
 def _self_ping_worker():
-    """১০ মিনিট পর পর নিজেকে নিজে HTTP রিকোয়েস্ট করে স্লিপ মোডে যাওয়া রোধ করে।"""
+    """১০ মিনিট পর পর লোকাল লুপব্যাকে HTTP রিকোয়েস্ট করে স্লিপ মোডে যাওয়া রোধ করে (০ ব্যান্ডউইথ খরচ)।"""
     port = _get_port()
     time.sleep(20)  # সার্ভার বুট হওয়ার জন্য অপেক্ষা
     while True:
         try:
-            # Render নিজে থেকেই RENDER_EXTERNAL_URL সেট করে, অথবা ইউজার APP_URL সেট করতে পারে
-            target_url = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEB_URL") or "").strip()
-            if not target_url:
-                target_url = f"http://127.0.0.1:{port}"
-            if not target_url.startswith("http://") and not target_url.startswith("https://"):
-                target_url = f"https://{target_url}"
-
+            target_url = f"http://127.0.0.1:{port}"
             res = requests.get(target_url, timeout=15)
-            logger.info(f"🔄 Self-ping sent to {target_url} (Status: {res.status_code})")
+            logger.info(f"🔄 Self-ping sent to local port {port} (Status: {res.status_code})")
         except Exception as e:
             logger.warning(f"Self-ping error: {e}")
 
