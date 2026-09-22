@@ -61,6 +61,8 @@ _db_lock = threading.RLock()
 _cf_dirty_sections = set()
 _cf_sync_lock = threading.Lock()
 _cf_sync_event = threading.Event()
+_cf_last_error = ""
+_cf_initialized = False
 
 def _empty_db():
     return {
@@ -78,7 +80,9 @@ def _empty_db():
 
 def _cf_d1_query(sql, params=None):
     """Cloudflare D1 REST API-তে কোয়েরি পাঠায়।"""
+    global _cf_last_error
     if not is_cf_enabled():
+        _cf_last_error = "Environment variables (CF_ACCOUNT_ID, CF_D1_DATABASE_ID, CF_API_TOKEN) missing"
         return None
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_DATABASE_ID}/query"
     headers = {
@@ -88,21 +92,31 @@ def _cf_d1_query(sql, params=None):
     body = {"sql": sql, "params": params or []}
     try:
         r = requests.post(url, headers=headers, json=body, timeout=12)
+        if r.status_code != 200:
+            err_msg = f"HTTP {r.status_code}: {r.text[:200]}"
+            _cf_last_error = err_msg
+            logger.error(f"Cloudflare D1 HTTP error: {err_msg}")
+            return None
         data = r.json()
         if data.get("success"):
+            _cf_last_error = ""
             res = data.get("result", [])
             if res and isinstance(res, list):
                 return res[0].get("results", [])
             return []
         else:
-            logger.error(f"Cloudflare D1 query failed: {data.get('errors')}")
+            errs = data.get('errors', [])
+            _cf_last_error = str(errs)
+            logger.error(f"Cloudflare D1 query failed: {errs}")
             return None
     except Exception as e:
+        _cf_last_error = str(e)
         logger.error(f"Cloudflare D1 request error: {e}")
         return None
 
 def _init_cf_d1():
     """Cloudflare D1 টেবিল তৈরি/ইনিশিয়ালাইজ করে।"""
+    global _cf_initialized
     if not is_cf_enabled():
         return False
     sql = """
@@ -114,14 +128,17 @@ def _init_cf_d1():
     """
     res = _cf_d1_query(sql)
     if res is not None:
+        _cf_initialized = True
         logger.info("✅ Cloudflare D1 database connected and initialized!")
         return True
     else:
-        logger.warning("⚠️ Cloudflare D1 connection failed. Falling back to local JSON.")
+        logger.warning(f"⚠️ Cloudflare D1 connection failed: {_cf_last_error}. Falling back to local JSON.")
         return False
 
 def _cf_save_section_direct(section, val):
     """সরাসরি Cloudflare D1-এ একটি সেকশন সেভ করে।"""
+    if not _cf_initialized:
+        _init_cf_d1()
     sql = """
     INSERT INTO bot_sections (section, data, updated_at)
     VALUES (?, ?, ?)
@@ -223,6 +240,8 @@ def _cf_sync_worker():
                     with _cf_sync_lock:
                         _cf_dirty_sections.add(sec)
             time.sleep(0.3)  # রেট লিমিট নিরাপদ রাখতে হালকা বিরতি
+
+threading.Thread(target=_cf_sync_worker, daemon=True).start()
 
 # Owner কে সবসময় admins-এর মধ্যে ধরে নেওয়া হয়, ডাটাবেসে আলাদা করে রাখারও দরকার নেই।
 
@@ -1026,8 +1045,9 @@ def cb(call):
     elif data == "cf_status":
         if not is_owner(cid):
             bot.answer_callback_query(call.id, "⛔ শুধু Owner!", show_alert=True); return
-        m = _mk(); m.add(_back("main_menu"))
+        m = _mk()
         if is_cf_enabled():
+            _init_cf_d1()
             test_res = _cf_d1_query("SELECT count(*) as count FROM bot_sections;")
             if test_res is not None:
                 cnt = test_res[0].get("count", 0) if test_res else 0
@@ -1039,21 +1059,51 @@ def cb(call):
                     f"📁 ক্লাউডে সিঙ্ক হওয়া সেকশন: <b>{cnt}</b>টি\n\n"
                     f"🎉 আপনার বটের সমস্ত ফাইল, ইউজার ও সেটিংস Render বন্ধ বা রিস্টার্ট হলেও <b>আজীবন সুরক্ষিত থাকবে</b>।"
                 )
+                m.add(_btn("🔄 এখনই সব ডাটা ক্লাউডে সিঙ্ক করুন", "cf_force_sync"))
             else:
+                err_detail = f"\n\n🔍 <b>ত্রুটির কারণ:</b> <code>{_cf_last_error}</code>" if _cf_last_error else ""
                 st_text = (
-                    "⚠️ <b>Cloudflare D1 কানেকশন ত্রুটি!</b>\n\n"
-                    "টোকেন বা ডাটাবেস আইডি সঠিক কিনা নিশ্চিত করুন। Render Environment Variables চেক করুন।"
+                    f"⚠️ <b>Cloudflare D1 কানেকশন ত্রুটি!</b>{err_detail}\n\n"
+                    "টোকেন বা ডাটাবেস আইডি সঠিক কিনা এবং টোকেনে <b>D1:Edit</b> পারমিশন আছে কিনা নিশ্চিত করুন।"
                 )
+                m.add(_btn("🔁 আবার চেষ্টা করুন", "cf_status"))
         else:
+            acc_ico = "✅" if CF_ACCOUNT_ID else "❌"
+            db_ico = "✅" if CF_D1_DATABASE_ID else "❌"
+            tok_ico = "✅" if CF_API_TOKEN else "❌"
             st_text = (
                 "🔴 <b>Cloudflare D1 সংযুক্ত নেই!</b>\n\n"
-                "বর্তমানে বটটি <b>লোকাল JSON ফাইল</b> ব্যবহার করছে। Render-এর ফ্রি সার্ভিসে রিস্টার্টের পর ডাটা মুছে যাওয়া রোধ করতে Cloudflare D1 যোগ করুন।\n\n"
-                "📌 <b>প্রয়োজনীয় ভেরিয়েবল (.env / Render):</b>\n"
-                "• <code>CF_ACCOUNT_ID</code>\n"
-                "• <code>CF_D1_DATABASE_ID</code>\n"
-                "• <code>CF_API_TOKEN</code>"
+                "বর্তমানে বটটি <b>লোকাল JSON ফাইল</b> ব্যবহার করছে। Render-এর ফ্রি সার্ভিসে রিস্টার্ট বা রিডিপ্লয়ের পর ডাটা মুছে যাওয়া রোধ করতে Render Environment Variables-এ নিচের ৩টি ভেরিয়েবল যোগ করুন:\n\n"
+                f"• <code>CF_ACCOUNT_ID</code> {acc_ico}\n"
+                f"• <code>CF_D1_DATABASE_ID</code> {db_ico}\n"
+                f"• <code>CF_API_TOKEN</code> {tok_ico}\n\n"
+                f"💡 <b>আপনার Cloudflare তথ্য:</b>\n"
+                f"Account ID: <code>280e4fe572c3f18cd3cee06ca95b709</code>\n"
+                f"Database ID: <code>7188fe28-87da-4e98-bacf-280a2fd7f8ba</code>"
             )
+            m.add(_btn("🔁 রিফ্রেশ করুন", "cf_status"))
+        m.add(_back("main_menu"))
         bot.edit_message_text(st_text, cid, mid, reply_markup=m)
+
+    elif data == "cf_force_sync":
+        if not is_owner(cid): return
+        bot.answer_callback_query(call.id, "⏳ ক্লাউডে সিঙ্ক হচ্ছে...")
+        synced = 0
+        failed = 0
+        _init_cf_d1()
+        with _db_lock:
+            items = list(DB.items())
+        for sec, val in items:
+            res = _cf_save_section_direct(sec, val)
+            if res is not None:
+                synced += 1
+            else:
+                failed += 1
+        msg = f"✅ সফলভাবে {synced}টি সেকশন সিঙ্ক হয়েছে!"
+        if failed:
+            msg += f" (⚠️ {failed}টি ব্যর্থ: {_cf_last_error[:40]})"
+        bot.answer_callback_query(call.id, msg, show_alert=True)
+        call.data = "cf_status"; cb(call)
 
     # ══ ফোর্স সাবস্ক্রাইব ══
     elif data == "menu_forcesub":
