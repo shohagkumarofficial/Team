@@ -492,7 +492,10 @@ threading.Thread(target=_scheduled_post_worker, daemon=True).start()
 #  TG SHORT (প্রতিটা admin এর নিজস্ব API key দিয়ে আর্নিং + ক্যাটাগরি)
 # ══════════════════════════════════════════════════
 class TgsError(Exception):
-    """TG SHORT API থেকে পাওয়া ব্যবহারকারী-বান্ধব ত্রুটি।"""
+    """TG SHORT API থেকে পাওয়া ব্যবহারকারী-বান্ধব ত্রুটি। `status` = HTTP স্ট্যাটাস (থাকলে)।"""
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 def _tgs_call(method, path, key, payload=None):
     if not TGSHORT_API_BASE:
@@ -510,9 +513,10 @@ def _tgs_call(method, path, key, payload=None):
     except ValueError:
         data = {}
     if r.status_code in (401, 403):
-        raise TgsError("API key সঠিক নয় বা এই অ্যাকাউন্টের API অ্যাক্সেস নেই।")
+        raise TgsError("API key সঠিক নয় বা এই অ্যাকাউন্টের API অ্যাক্সেস নেই।", r.status_code)
     if r.status_code >= 400:
-        raise TgsError(str(data.get("detail") or f"TG SHORT ত্রুটি ({r.status_code})"))
+        logger.warning(f"TG SHORT {method} {path} -> {r.status_code}: {data}")
+        raise TgsError(str(data.get("detail") or f"TG SHORT ত্রুটি ({r.status_code})"), r.status_code)
     return data
 
 def tgs_me(key):
@@ -526,7 +530,15 @@ def tgs_account_label(me):
     return f"ID {me.get('telegram_id', '')}"
 
 def tgs_categories(key):
-    return _tgs_call("GET", "/api/v1/categories", key).get("categories", [])
+    """অ্যাকাউন্টের ক্যাটাগরির তালিকা [{"id","name"}…]। TG SHORT সার্ভারে নতুন /categories এন্ডপয়েন্ট না
+    থাকলে (404) পুরনো /me রেসপন্সের ভেতরের ক্যাটাগরি থেকে পড়ে, তাই দুই ধরনের সার্ভারেই কাজ করে।"""
+    try:
+        cats = _tgs_call("GET", "/api/v1/categories", key).get("categories", [])
+    except TgsError as e:
+        if e.status != 404:
+            raise
+        cats = _tgs_call("GET", "/api/v1/me", key).get("categories", []) or []
+    return [{"id": c["id"], "name": c.get("name", "")} for c in cats if c.get("id")]
 
 def tgs_create_short_link(key, url, title="", category_id=""):
     """TG SHORT-এ `url` শর্ট করে শর্ট লিংক ফেরত দেয়। ব্যর্থ হলে TgsError।"""
@@ -1594,6 +1606,8 @@ def _ask_tgs_category(chat_id, flow):
         return
     update_user(chat_id, {"step": "wait_tgs_category", "_tgs_flow": flow})
     if not cats:
+        bot.send_message(chat_id, f"ℹ️ TG SHORT অ্যাকাউন্ট <b>{clean_html(user.get('tgs_label') or '')}</b>-এ কোনো ক্যাটাগরি পাওয়া যায়নি — এবার ক্যাটাগরি ছাড়াই লিংক তৈরি হচ্ছে।\n"
+                                  "(ক্যাটাগরি যে অ্যাকাউন্টে বানিয়েছেন, ঠিক সেই অ্যাকাউন্টের API key সংযুক্ত আছে কিনা দেখুন।)")
         _finish_with_tgs_link(chat_id, None, get_user(chat_id), "")
         return
     default_id, default_name = user.get("tgs_category_id", ""), user.get("tgs_category_name", "")
@@ -1605,7 +1619,7 @@ def _ask_tgs_category(chat_id, flow):
     if default_id:
         m.add(_btn("ক্যাটাগরি ছাড়া", "tgspick:"))
     m.add(_btn("🚫 বাতিল", "tgscancel"))
-    bot.send_message(chat_id, "🗂 <b>এই পোস্টের ক্যাটাগরি বাছুন</b>\n(TG SHORT-এ লিংকটি এই ক্যাটাগরিতে তৈরি হবে)", reply_markup=m)
+    bot.send_message(chat_id, f"🗂 <b>এই পোস্টের ক্যাটাগরি বাছুন</b>\n👤 {clean_html(user.get('tgs_label') or 'TG SHORT')} · {len(cats)}টি ক্যাটাগরি\n(TG SHORT-এ লিংকটি এই ক্যাটাগরিতে তৈরি হবে)", reply_markup=m)
 
 def _finish_with_tgs_link(chat_id, mid, user, category_id):
     """বাছাই করা ক্যাটাগরি দিয়ে TG SHORT-এ ডাউনলোড লিংক বানিয়ে পোস্টের পরের ধাপে যায়।"""
@@ -1782,10 +1796,11 @@ def handle_message(message):
             bot.send_message(chat_id, f"❌ {clean_html(str(e))}\n\nসঠিক API key আবার পাঠান, অথবা /cancel।"); return
         label = tgs_account_label(me)
         update_user(chat_id, {"tgs_key": key, "tgs_label": label, "tgs_category_id": "", "tgs_category_name": "", "step": "none"})
+        cat_err = ""
         try:
             n_cats = len(tgs_categories(key))
-        except TgsError:
-            n_cats = 0
+        except TgsError as e:
+            n_cats, cat_err = 0, str(e)
         m = _mk()
         if n_cats: m.add(_btn("🗂 ডিফল্ট ক্যাটাগরি বাছুন", "tgs_pick_default"))
         m.add(_btn("⚙️ সেটিংস", "menu_settings_back"))
@@ -1793,7 +1808,9 @@ def handle_message(message):
             chat_id,
             f"✅ <b>TG SHORT সংযুক্ত হয়েছে!</b>\n👤 অ্যাকাউন্ট: <b>{clean_html(label)}</b>\n🗂 ক্যাটাগরি পাওয়া গেছে: <b>{n_cats}</b>টি\n\n"
             "এখন থেকে আপনার পোস্টের ডাউনলোড লিংক অটো তৈরি হবে — ম্যানুয়ালি লিংক পাঠাতে হবে না।"
-            + ("" if n_cats else "\n\n<i>ক্যাটাগরি দিয়ে পোস্ট করতে TG SHORT প্যানেল → Profile → Categories-এ ক্যাটাগরি বানান।</i>"),
+            + ("" if n_cats else (
+                f"\n\n⚠️ ক্যাটাগরি আনা যায়নি: {clean_html(cat_err)}" if cat_err else
+                f"\n\n<i>এই অ্যাকাউন্ট (<b>{clean_html(label)}</b>)-এ কোনো ক্যাটাগরি নেই। ক্যাটাগরি দিয়ে পোস্ট করতে TG SHORT প্যানেল → Profile → Categories-এ বানান — <b>একই অ্যাকাউন্টে</b>, যেটার API key এখানে দিয়েছেন।</i>")),
             reply_markup=m)
         return
 
