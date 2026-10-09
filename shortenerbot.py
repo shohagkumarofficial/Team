@@ -3,7 +3,7 @@
 ║        🚀 MULTI-ADMIN FILE SHARE BOT v7.0                    ║
 ║   Owner → Admin (request/approve) → User                     ║
 ║   JSON Storage · No Firebase/Mongo/Web-Panel                 ║
-║   Fixed Channels (ENV) · Per-Admin Shortener Earning          ║
+║   Fixed Channels (ENV) · Per-Admin TG SHORT API Earning       ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -41,7 +41,10 @@ AD_CHANNEL_IDS      = [c.strip() for c in os.environ.get("AD_CHANNEL_IDS", "").s
 PREMIUM_CHANNEL_IDS = [c.strip() for c in os.environ.get("PREMIUM_CHANNEL_IDS", "").split(",") if c.strip()]
 LOG_CHANNEL_ID       = os.environ.get("LOG_CHANNEL_ID", "").strip()
 
-SHORTENER_API_BASE = os.environ.get("SHORTENER_API_BASE", "https://teraboxlinks.com/api")
+# TG SHORT প্ল্যাটফর্মের বেস URL (যেমন https://your-app.onrender.com) — প্রতিটা admin নিজের
+# TG SHORT অ্যাকাউন্টের API key দিয়ে এখানে সংযুক্ত হয়, আর পোস্টের ডাউনলোড লিংক সেই অ্যাকাউন্টে
+# (নিজের বেছে নেওয়া ক্যাটাগরিসহ) শর্ট হয়। ফাঁকা থাকলে TG SHORT ফিচার বন্ধ থাকে।
+TGSHORT_API_BASE = os.environ.get("TGSHORT_API_BASE", "").strip().rstrip("/")
 
 DATA_FILE   = os.environ.get("DATA_FILE", os.path.join(os.path.dirname(__file__), "data", "database.json"))
 BOT_VERSION = "7.0.0"
@@ -298,7 +301,11 @@ _DEFAULTS = {
     "step": "none", "batch_id": "",
     "link_filter": 0, "text_filter": 0,
     "link_repeat_count": 1,
-    "terabox_key": "",           # প্রতিটা admin এর নিজস্ব শর্টেনার API key (আর্নিং এর জন্য)
+    "tgs_key": "",               # admin এর নিজের TG SHORT API key (আর্নিং এর জন্য)
+    "tgs_label": "",             # সংযুক্ত TG SHORT অ্যাকাউন্টের নাম (দেখানোর জন্য)
+    "tgs_category_id": "",       # ডিফল্ট ক্যাটাগরি (TG SHORT অ্যাকাউন্টের) — ফাঁকা = ক্যাটাগরি ছাড়া
+    "tgs_category_name": "",
+    "_tgs_flow": "",             # ক্যাটাগরি বাছাইয়ের সময় কোন ফ্লোতে আছি: "video" | "generic"
     "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "",
     "pending_link": "", "pending_short_link": "",
     "_adch_name": "",
@@ -322,6 +329,7 @@ def get_user(chat_id):
             for k, v in _DEFAULTS.items():
                 if k not in user:
                     user[k] = v
+            user.pop("terabox_key", None)  # পুরনো শর্টেনার key আর রাখা হয় না
             user["last_active"] = now
             if chat_id == MAIN_ADMIN_ID and user.get("role") != "owner":
                 user["role"] = "owner"
@@ -462,7 +470,8 @@ def _scheduled_post_worker():
                     _publish_to_channels(admin_id, user, item['media_type'], item['media_id'],
                                           item.get('d_link', ''), item.get('title', ''),
                                           manual_short_link=item.get('manual_short_link') or None,
-                                          thumb_id=item.get('thumb_id', ''))
+                                          thumb_id=item.get('thumb_id', ''),
+                                          category_id=item.get('tgs_category_id'))
                     try:
                         bot.send_message(admin_id, "⏰ <b>সিডিউল পোস্ট সম্পন্ন হয়েছে!</b>")
                     except Exception:
@@ -480,18 +489,54 @@ def _scheduled_post_worker():
 threading.Thread(target=_scheduled_post_worker, daemon=True).start()
 
 # ══════════════════════════════════════════════════
-#  শর্টেনার (প্রতিটা admin এর নিজস্ব key দিয়ে আর্নিং)
+#  TG SHORT (প্রতিটা admin এর নিজস্ব API key দিয়ে আর্নিং + ক্যাটাগরি)
 # ══════════════════════════════════════════════════
-def get_short_link(url, terabox_key):
-    if not terabox_key:
-        return url  # key না থাকলে direct link-ই ফেরত যাবে
+class TgsError(Exception):
+    """TG SHORT API থেকে পাওয়া ব্যবহারকারী-বান্ধব ত্রুটি।"""
+
+def _tgs_call(method, path, key, payload=None):
+    if not TGSHORT_API_BASE:
+        raise TgsError("TG SHORT সংযোগ এখনো চালু করা হয়নি (Owner-কে TGSHORT_API_BASE সেট করতে হবে)।")
     try:
-        r = requests.get(f"{SHORTENER_API_BASE}?api={terabox_key}&url={quote(url)}", timeout=8).json()
-        if r and r.get("status") != "error" and r.get("shortenedUrl"):
-            return r["shortenedUrl"]
-    except Exception as e:
-        logger.warning(f"ShortLink: {e}")
-    return url
+        r = requests.request(
+            method, f"{TGSHORT_API_BASE}{path}", json=payload,
+            headers={"X-API-Key": key}, timeout=12,
+        )
+    except requests.RequestException as e:
+        logger.warning(f"TG SHORT request failed: {e}")
+        raise TgsError("TG SHORT সার্ভারে পৌঁছানো যায়নি। একটু পরে আবার চেষ্টা করুন।")
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    if r.status_code in (401, 403):
+        raise TgsError("API key সঠিক নয় বা এই অ্যাকাউন্টের API অ্যাক্সেস নেই।")
+    if r.status_code >= 400:
+        raise TgsError(str(data.get("detail") or f"TG SHORT ত্রুটি ({r.status_code})"))
+    return data
+
+def tgs_me(key):
+    """সংযুক্ত TG SHORT অ্যাকাউন্টের তথ্য (key ঠিক কিনা যাচাইয়েও ব্যবহৃত)।"""
+    return _tgs_call("GET", "/api/v1/me", key)
+
+def tgs_account_label(me):
+    name = (me.get("display_name") or "").strip()
+    if name: return name
+    if me.get("username"): return "@" + str(me["username"])
+    return f"ID {me.get('telegram_id', '')}"
+
+def tgs_categories(key):
+    return _tgs_call("GET", "/api/v1/categories", key).get("categories", [])
+
+def tgs_create_short_link(key, url, title="", category_id=""):
+    """TG SHORT-এ `url` শর্ট করে শর্ট লিংক ফেরত দেয়। ব্যর্থ হলে TgsError।"""
+    payload = {"destination_url": url}
+    if title: payload["title"] = title[:100]
+    if category_id: payload["category_id"] = category_id
+    data = _tgs_call("POST", "/api/v1/links", key, payload)
+    if not data.get("short_url"):
+        raise TgsError("TG SHORT লিংক তৈরি করতে পারেনি।")
+    return data["short_url"]
 
 def _get_file_count_from_link(key):
     cnt = sum(1 for f in DB["files"].values() if f.get("batch_id") == key)
@@ -606,7 +651,7 @@ def _send_video_with_thumb(ch_id, file_id, thumb_id, **kw):
             logger.warning(f"send_video with custom thumb failed, sending without: {e}")
     return bot.send_video(ch_id, file_id, **kw)
 
-def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short_link=None, thumb_id=""):
+def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short_link=None, thumb_id="", category_id=None):
     """ফিক্সড Ad/Premium/Log চ্যানেলে (ENV থেকে) পোস্ট করে।"""
     ph = apply_filters(title or user.get("header", ""), admin_id)
     pf = apply_filters(user.get("footer", ""), admin_id)
@@ -620,15 +665,24 @@ def _publish_to_channels(admin_id, user, mtype, mid, d_link, title, manual_short
     fc_txt = f"📁 <b>মোট ফাইল: {file_count}টি</b>\n" if file_count > 0 else ""
 
     if manual_short_link:
-        # অ্যাডমিন নিজে শর্টেনার সাইট থেকে বানিয়ে দেওয়া লিংক — এটাই ব্যবহার হবে
+        # আগেই বানানো TG SHORT লিংক (বা অ্যাডমিনের নিজে দেওয়া লিংক) — এটাই ব্যবহার হবে
         short_link = manual_short_link
     else:
-        terabox_key = user.get("terabox_key", "")
-        short_link = get_short_link(d_link, terabox_key)
+        short_link = d_link  # key না থাকলে বা ব্যর্থ হলে direct link-ই যাবে
+        tgs_key = user.get("tgs_key", "")
         ad_channel_ids = get_admin_ad_channel_ids(admin_id)
-        if not terabox_key and ad_channel_ids:
+        if tgs_key:
             try:
-                bot.send_message(admin_id, "⚠️ আপনার TeraBox/শর্টেনার API key সেট করা নেই — আপাতত সরাসরি লিংক ব্যবহার হচ্ছে, আর্নিং হবে না।\n🔧 সেট করতে: ⚙️ সেটিংস → 🔗 শর্টেনার Key")
+                cat = user.get("tgs_category_id", "") if category_id is None else category_id
+                short_link = tgs_create_short_link(tgs_key, d_link, title or "", cat or "")
+            except TgsError as e:
+                try:
+                    bot.send_message(admin_id, f"⚠️ TG SHORT লিংক বানানো যায়নি, সরাসরি লিংক ব্যবহার হয়েছে (আর্নিং হবে না)।\n{e}")
+                except Exception:
+                    pass
+        elif ad_channel_ids:
+            try:
+                bot.send_message(admin_id, "⚠️ আপনার TG SHORT API key সংযুক্ত নেই — আপাতত সরাসরি লিংক ব্যবহার হচ্ছে, আর্নিং হবে না।\n🔧 সংযুক্ত করতে: ⚙️ সেটিংস → 🔑 TG SHORT সংযুক্ত করুন")
             except Exception:
                 pass
 
@@ -765,7 +819,8 @@ def _settings_menu(u):
         f"⏱️ অটো-ডিলিট: <b>{u.get('auto_delete',0)} মিনিট</b> (0 = বন্ধ)\n"
         f"🔄 লিংক রিপিট: <b>{u.get('link_repeat_count',1)}x</b>\n"
         f"🔗 লিংক ফিল্টার: {lf} | 📝 টেক্সট ফিল্টার: {tf}\n"
-        f"🔑 শর্টেনার Key: {'✅ সেট করা আছে' if u.get('terabox_key') else '❌ সেট করা নেই'}\n"
+        f"🔑 TG SHORT: {('✅ ' + clean_html(u.get('tgs_label') or 'সংযুক্ত')) if u.get('tgs_key') else '❌ সংযুক্ত নেই'}\n"
+        f"🗂 ডিফল্ট ক্যাটাগরি: <b>{clean_html(u.get('tgs_category_name')) if u.get('tgs_category_name') else 'নেই'}</b>\n"
     ), InlineKeyboardMarkup(row_width=2).add(
         _btn("📝 হেডার সেট", "set_header"), _btn("📝 ফুটার সেট", "set_footer")
     ).add(
@@ -773,7 +828,9 @@ def _settings_menu(u):
     ).add(
         _btn(f"🔗 লিংক ফিল্টার {lf}", "tog_linkfilter"), _btn(f"📝 টেক্সট ফিল্টার {tf}", "tog_textfilter")
     ).add(
-        _btn("🔑 শর্টেনার Key সেট", "set_terabox")
+        _btn("🔑 Key বদলান" if u.get("tgs_key") else "🔑 TG SHORT সংযুক্ত করুন", "set_tgs_key")
+    ).add(
+        *([_btn("🗂 ডিফল্ট ক্যাটাগরি", "tgs_pick_default"), _btn("🔌 বিচ্ছিন্ন করুন", "tgs_disconnect")] if u.get("tgs_key") else [_btn("ℹ️ কীভাবে সংযুক্ত করবেন?", "tgs_help")])
     ).add(_back("main_menu"))
 
 def _show_main_menu(chat_id, edit_msg_id=None):
@@ -918,7 +975,7 @@ def cb(call):
                 DB["admin_requests"].pop(target, None)
                 save_db()
             try:
-                bot.send_message(target, "🎉 <b>অভিনন্দন! আপনি Admin হয়েছেন!</b>\n\nএখন ফাইল আপলোড, পোস্ট, শিডিউল সহ সব ফিচার আনলক।\n🔧 আর্নিং করতে ⚙️ সেটিংস থেকে আপনার শর্টেনার (TeraBox) API key যোগ করুন।")
+                bot.send_message(target, "🎉 <b>অভিনন্দন! আপনি Admin হয়েছেন!</b>\n\nএখন ফাইল আপলোড, পোস্ট, শিডিউল সহ সব ফিচার আনলক।\n🔧 আর্নিং করতে ⚙️ সেটিংস থেকে আপনার TG SHORT API key সংযুক্ত করুন।")
                 _show_main_menu(target)
             except Exception: pass
             bot.edit_message_text(f"✅ Accepted: <code>{target}</code>", cid, mid)
@@ -1033,9 +1090,80 @@ def cb(call):
         update_step(cid, "wait_linkrepeat")
         bot.edit_message_text("🔄 লিংক রিপিট সংখ্যা লিখুন (1-5):", cid, mid)
 
-    elif data == "set_terabox":
-        update_step(cid, "wait_terabox")
-        bot.edit_message_text("🔑 আপনার শর্টেনার (TeraBox) API key পাঠান:", cid, mid)
+    elif data == "tgs_help":
+        m = _mk(); m.add(_back("menu_settings_back"))
+        bot.edit_message_text(
+            "ℹ️ <b>TG SHORT সংযুক্ত করার নিয়ম</b>\n\n"
+            "১) TG SHORT প্যানেলে যান → <b>Profile → API Access</b>\n"
+            "২) নতুন key বানান ও কপি করুন\n"
+            "৩) এখানে <b>🔑 TG SHORT সংযুক্ত করুন</b> চেপে key পাঠান\n\n"
+            "সংযুক্ত হলে আপনার প্রতিটা পোস্টের ডাউনলোড লিংক নিজের TG SHORT অ্যাকাউন্টে "
+            "(আপনার বেছে নেওয়া ক্যাটাগরিসহ) অটো তৈরি হবে এবং ইনকাম আপনার অ্যাকাউন্টে জমা হবে।",
+            cid, mid, reply_markup=m)
+
+    elif data == "menu_settings_back":
+        text, mk = _settings_menu(get_user(cid))
+        bot.edit_message_text(text, cid, mid, reply_markup=mk)
+
+    elif data == "set_tgs_key":
+        if not is_admin(cid): return
+        if not TGSHORT_API_BASE:
+            bot.answer_callback_query(call.id, "TG SHORT সংযোগ এখনো চালু নেই — Owner-কে জানান।", show_alert=True); return
+        update_step(cid, "wait_tgs_key")
+        bot.edit_message_text(
+            "🔑 আপনার <b>TG SHORT API key</b> পাঠান।\n\n"
+            "(TG SHORT প্যানেল → Profile → API Access থেকে বানানো যায়)\n"
+            "🔒 নিরাপত্তার জন্য পাঠানোর পর আমি আপনার মেসেজটা মুছে দেব।\n"
+            "বাতিল করতে /cancel", cid, mid)
+
+    elif data == "tgs_disconnect":
+        update_user(cid, {"tgs_key": "", "tgs_label": "", "tgs_category_id": "", "tgs_category_name": ""})
+        bot.answer_callback_query(call.id, "TG SHORT বিচ্ছিন্ন করা হয়েছে — key মুছে ফেলা হয়েছে।", show_alert=True)
+        text, mk = _settings_menu(get_user(cid))
+        bot.edit_message_text(text, cid, mid, reply_markup=mk)
+
+    elif data == "tgs_pick_default":
+        key = user.get("tgs_key", "")
+        if not key: return
+        try:
+            cats = tgs_categories(key)
+        except TgsError as e:
+            bot.answer_callback_query(call.id, str(e)[:190], show_alert=True); return
+        m = _mk()
+        for c in cats:
+            m.add(_btn(("✅ " if c["id"] == user.get("tgs_category_id") else "🗂 ") + str(c["name"])[:40], f"tgsdef:{c['id']}"))
+        m.add(_btn(("✅ " if not user.get("tgs_category_id") else "") + "ক্যাটাগরি ছাড়া", "tgsdef:"))
+        m.add(_back("menu_settings_back"))
+        note = "" if cats else "\n\n<i>আপনার TG SHORT অ্যাকাউন্টে এখনো কোনো ক্যাটাগরি নেই। TG SHORT প্যানেল → Profile → Categories থেকে বানান।</i>"
+        bot.edit_message_text("🗂 <b>ডিফল্ট ক্যাটাগরি বাছুন</b>\nনতুন পোস্টে এটাই আগে থেকে ধরা থাকবে (প্রতিটা পোস্টে বদলানোও যাবে)।" + note, cid, mid, reply_markup=m)
+
+    elif data.startswith("tgsdef:"):
+        cat_id = data[7:]
+        name = ""
+        if cat_id:
+            try:
+                name = next((str(c["name"]) for c in tgs_categories(user.get("tgs_key", "")) if c["id"] == cat_id), "")
+            except TgsError as e:
+                bot.answer_callback_query(call.id, str(e)[:190], show_alert=True); return
+            if not name:
+                bot.answer_callback_query(call.id, "ক্যাটাগরিটি পাওয়া যায়নি।", show_alert=True); return
+        update_user(cid, {"tgs_category_id": cat_id, "tgs_category_name": name})
+        bot.answer_callback_query(call.id, "✅ ডিফল্ট ক্যাটাগরি সেভ হয়েছে।")
+        text, mk = _settings_menu(get_user(cid))
+        bot.edit_message_text(text, cid, mid, reply_markup=mk)
+
+    elif data.startswith("tgspick:"):
+        if user.get("step") != "wait_tgs_category":
+            bot.answer_callback_query(call.id, "এই ধাপটি আর সক্রিয় নেই।", show_alert=True); return
+        bot.answer_callback_query(call.id)
+        pick = data[8:]
+        category_id = user.get("tgs_category_id", "") if pick == "__def__" else pick
+        _finish_with_tgs_link(cid, mid, user, category_id)
+
+    elif data == "tgscancel":
+        update_user(cid, {"step": "none", "_tgs_flow": "", "pending_link": "", "post_title": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "", "pending_short_link": ""})
+        bot.answer_callback_query(call.id, "বাতিল করা হয়েছে।")
+        _show_main_menu(cid)
 
     elif data == "tog_linkfilter":
         update_user(cid, {"link_filter": 0 if user.get("link_filter") else 1})
@@ -1387,6 +1515,10 @@ def _handle_thumbnail_received(chat_id, thumb_id, user):
         "pending_link": file_key, "temp_thumb_id": thumb_id, "step": "wait_video_dl_link",
     })
 
+    if user.get("tgs_key"):
+        _ask_tgs_category(chat_id, "video")
+        return
+
     m = _build_copy_button(d_link)
     header_txt = "✅ <b>থাম্বনেইল সেট হয়েছে!</b>" if thumb_id else "✅ <b>ভিডিও সংরক্ষিত হয়েছে!</b>"
     msg_txt = (
@@ -1395,7 +1527,8 @@ def _handle_thumbnail_received(chat_id, thumb_id, user):
         f"<code>{d_link}</code>\n"
         f"<i>(কোড লিংকে বা নিচের বাটনে ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
         f"📥 <b>এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।</b>\n"
-        f"(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই চ্যানেলের ডাউনলোড বাটনে যাবে)"
+        f"(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই চ্যানেলের ডাউনলোড বাটনে যাবে)\n\n"
+        f"💡 <i>লিংক অটো তৈরি করতে ⚙️ সেটিংস থেকে TG SHORT সংযুক্ত করুন।</i>"
     )
     bot.send_message(chat_id, msg_txt, reply_markup=m)
 
@@ -1442,6 +1575,65 @@ def _handle_download_link_received(chat_id, link_text, user):
         "step": "none", "pending_link": "", "temp_media_id": "", "temp_media_type": "", "temp_thumb_id": "",
     })
     bot.send_message(chat_id, f"✅ <b>পোস্ট সম্পন্ন!</b>\n📤 <b>{posted}</b>টি Ads চ্যানেলে পোস্ট হয়েছে।\n🔗 ডাউনলোড লিংক: {dl_link}")
+
+def _ask_tgs_category(chat_id, flow):
+    """TG SHORT সংযুক্ত admin-এর জন্য: এই পোস্টের ক্যাটাগরি বাছাইয়ের মেনু দেখায়।
+    ক্যাটাগরি না থাকলে সরাসরি লিংক বানিয়ে ফেলে। ব্যর্থ হলে ম্যানুয়াল লিংকের ধাপে ফেরে।"""
+    user = get_user(chat_id)
+    manual_step = "wait_video_dl_link" if flow == "video" else "wait_post_dl_link"
+    if flow == "video" and not get_admin_ad_channel_ids(chat_id):
+        update_user(chat_id, {"step": "none", "_tgs_flow": ""})
+        bot.send_message(chat_id, "⚠️ কোনো Ads চ্যানেল যোগ করা নেই। আগে 📢 Ads চ্যানেল মেনু থেকে একটি যোগ করুন, তারপর আবার আপলোড করুন।")
+        return
+    try:
+        cats = tgs_categories(user.get("tgs_key", ""))
+    except TgsError as e:
+        update_user(chat_id, {"step": manual_step, "_tgs_flow": ""})
+        bot.send_message(chat_id, f"⚠️ TG SHORT থেকে ক্যাটাগরি আনা যায়নি:\n{clean_html(str(e))}\n\n"
+                                  "চাইলে নিজে বানানো ডাউনলোড লিংক এখানে পাঠান, অথবা ⚙️ সেটিংস থেকে key ঠিক করে আবার আপলোড করুন।")
+        return
+    update_user(chat_id, {"step": "wait_tgs_category", "_tgs_flow": flow})
+    if not cats:
+        _finish_with_tgs_link(chat_id, None, get_user(chat_id), "")
+        return
+    default_id, default_name = user.get("tgs_category_id", ""), user.get("tgs_category_name", "")
+    m = _mk()
+    m.add(_btn(f"▶️ ডিফল্ট: {default_name or 'ক্যাটাগরি ছাড়া'}", "tgspick:__def__"))
+    for c in cats:
+        if c["id"] != default_id:
+            m.add(_btn(f"🗂 {str(c['name'])[:40]}", f"tgspick:{c['id']}"))
+    if default_id:
+        m.add(_btn("ক্যাটাগরি ছাড়া", "tgspick:"))
+    m.add(_btn("🚫 বাতিল", "tgscancel"))
+    bot.send_message(chat_id, "🗂 <b>এই পোস্টের ক্যাটাগরি বাছুন</b>\n(TG SHORT-এ লিংকটি এই ক্যাটাগরিতে তৈরি হবে)", reply_markup=m)
+
+def _finish_with_tgs_link(chat_id, mid, user, category_id):
+    """বাছাই করা ক্যাটাগরি দিয়ে TG SHORT-এ ডাউনলোড লিংক বানিয়ে পোস্টের পরের ধাপে যায়।"""
+    flow = user.get("_tgs_flow", "")
+    bid = user.get("pending_link", "")
+    if not bid or flow not in ("video", "generic"):
+        update_user(chat_id, {"step": "none", "_tgs_flow": ""})
+        bot.send_message(chat_id, "❌ কিছু একটা ভুল হয়েছে, আবার আপলোড করুন।")
+        return
+    d_link = f"https://t.me/{BOT_USERNAME}?start={bid}"
+    title = re.sub(r"<[^>]+>", "", user.get("post_title", "") or "").strip() if flow == "generic" else ""
+    try:
+        short = tgs_create_short_link(user.get("tgs_key", ""), d_link, title, category_id or "")
+    except TgsError as e:
+        manual_step = "wait_video_dl_link" if flow == "video" else "wait_post_dl_link"
+        update_user(chat_id, {"step": manual_step, "_tgs_flow": ""})
+        bot.send_message(chat_id, f"❌ TG SHORT লিংক বানানো যায়নি:\n{clean_html(str(e))}\n\n"
+                                  "সমস্যা ঠিক করে আবার আপলোড করুন, অথবা নিজে বানানো ডাউনলোড লিংক এখানে পাঠান।")
+        return
+    update_user(chat_id, {"step": "none", "_tgs_flow": ""})
+    if mid:
+        try: bot.edit_message_text(f"✅ TG SHORT লিংক তৈরি হয়েছে:\n<code>{short}</code>", chat_id, mid)
+        except Exception: pass
+    user = get_user(chat_id)
+    if flow == "video":
+        _handle_download_link_received(chat_id, short, user)
+    else:
+        _handle_generic_dl_link_received(chat_id, short, user)
 
 def _handle_generic_dl_link_received(chat_id, link_text, user):
     """জেনেরিক ফ্লো (photo/document/audio/ব্যাচ): টাইটেলের পর ম্যানুয়াল শর্টেনার লিংক নিয়ে পোস্ট-নাউ/সিডিউল অপশন দেখানো।"""
@@ -1510,6 +1702,10 @@ def _finalize_post(chat_id, mid, title):
 
     update_user(chat_id, {"post_title": title, "temp_media_id": mid_, "temp_media_type": mtype, "temp_thumb_id": thumb_id, "step": "wait_post_dl_link"})
 
+    if user.get("tgs_key"):
+        _ask_tgs_category(chat_id, "generic")
+        return
+
     d_link = f"https://t.me/{BOT_USERNAME}?start={bid}"
     m = _build_copy_button(d_link)
 
@@ -1520,7 +1716,8 @@ def _finalize_post(chat_id, mid, title):
         f"<code>{d_link}</code>\n"
         f"<i>(কোড লিংকে বা নিচের বাটনে ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
         f"📥 <b>এখন আপনার শর্টেনার ওয়েবসাইট থেকে বানানো ডাউনলোড লিংকটি পাঠান।</b>\n"
-        f"(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই চ্যানেলের ডাউনলোড বাটনে যাবে)"
+        f"(উপরের বট লিংকটি শর্টেনার সাইটে দিয়ে যে earning লিংক পাবেন, সেটাই এখানে পাঠান — এটাই চ্যানেলের ডাউনলোড বাটনে যাবে)\n\n"
+        f"💡 <i>লিংক অটো তৈরি করতে ⚙️ সেটিংস থেকে TG SHORT সংযুক্ত করুন।</i>"
     )
     if mid:
         try:
@@ -1575,9 +1772,30 @@ def handle_message(message):
         except ValueError:
             bot.send_message(chat_id, "⚠️ শুধু সংখ্যা দিন (1-5)।")
         return
-    if step == "wait_terabox" and text:
-        update_user(chat_id, {"terabox_key": text, "step": "none"})
-        bot.send_message(chat_id, "✅ শর্টেনার API key সেভ হয়েছে। এখন থেকে আপনার পোস্টের Download লিংক আর্নিং-এনাবলড হবে।"); return
+    if step == "wait_tgs_key" and text:
+        key = text.strip()
+        try: bot.delete_message(chat_id, message.message_id)  # key যেন চ্যাটে পড়ে না থাকে
+        except Exception: pass
+        try:
+            me = tgs_me(key)
+        except TgsError as e:
+            bot.send_message(chat_id, f"❌ {clean_html(str(e))}\n\nসঠিক API key আবার পাঠান, অথবা /cancel।"); return
+        label = tgs_account_label(me)
+        update_user(chat_id, {"tgs_key": key, "tgs_label": label, "tgs_category_id": "", "tgs_category_name": "", "step": "none"})
+        try:
+            n_cats = len(tgs_categories(key))
+        except TgsError:
+            n_cats = 0
+        m = _mk()
+        if n_cats: m.add(_btn("🗂 ডিফল্ট ক্যাটাগরি বাছুন", "tgs_pick_default"))
+        m.add(_btn("⚙️ সেটিংস", "menu_settings_back"))
+        bot.send_message(
+            chat_id,
+            f"✅ <b>TG SHORT সংযুক্ত হয়েছে!</b>\n👤 অ্যাকাউন্ট: <b>{clean_html(label)}</b>\n🗂 ক্যাটাগরি পাওয়া গেছে: <b>{n_cats}</b>টি\n\n"
+            "এখন থেকে আপনার পোস্টের ডাউনলোড লিংক অটো তৈরি হবে — ম্যানুয়ালি লিংক পাঠাতে হবে না।"
+            + ("" if n_cats else "\n\n<i>ক্যাটাগরি দিয়ে পোস্ট করতে TG SHORT প্যানেল → Profile → Categories-এ ক্যাটাগরি বানান।</i>"),
+            reply_markup=m)
+        return
 
     # ══ ফোর্স সাব যোগ (multi-step) ══
     if step == "wait_fs_name" and text:
