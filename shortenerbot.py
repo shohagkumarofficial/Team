@@ -19,6 +19,36 @@ try:
 except ImportError:
     _PIL_OK = False
 
+
+# ══════════════════════════════════════════════════
+#  .env লোডার (হোস্টিং প্যানেল যদি মান .env ফাইলে লেখে, প্রসেস env-এ না দেয়)
+# ══════════════════════════════════════════════════
+def _load_dotenv():
+    seen = set()
+    for d in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
+        path = os.path.join(d, ".env")
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    if line.startswith("export "):
+                        line = line[7:]
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    if k and not os.environ.get(k):
+                        os.environ[k] = v
+        except Exception as e:
+            print("⚠️ .env পড়া যায়নি: " + str(e), flush=True)
+
+_load_dotenv()
+
 # ══════════════════════════════════════════════════
 #  লগিং
 # ══════════════════════════════════════════════════
@@ -32,7 +62,11 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════
 #  কনফিগারেশন (.env থেকে)
 # ══════════════════════════════════════════════════
-BOT_TOKEN      = os.environ.get("BOT_TOKEN")
+BOT_TOKEN      = (os.environ.get("BOT_TOKEN") or "").strip().strip('"').strip("'").strip()
+if ":" not in BOT_TOKEN:
+    _why = "খালি (env পৌঁছায়নি)" if not BOT_TOKEN else (str(len(BOT_TOKEN)) + " অক্ষর আছে, কিন্তু কোলন নেই")
+    print("❌ BOT_TOKEN সঠিক নয়! পাওয়া গেছে: " + _why + "। সঠিক ফরম্যাট 123456789:ABC... — env ঠিক করে Restart দিন।", flush=True)
+    raise SystemExit(1)
 BOT_USERNAME   = os.environ.get("BOT_USERNAME", "YourBotUsername")
 MAIN_ADMIN_ID  = str(os.environ.get("MAIN_ADMIN_ID", "5991854507"))  # Owner chat_id
 
